@@ -23,7 +23,7 @@ import contextlib
 import glob
 import os
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -39,15 +39,21 @@ RESERVED = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!",
                       "done", "esac"})
 HEADERS = frozenset({"for", "case", "select", "function"})
 
+# Programs with no option that writes a file, runs a program or changes the system. Read-
+# only programs that do have one are judged argument by argument (see `_READ_RULES`).
 READ_ONLY = frozenset({
-    "cat", "tac", "head", "tail", "less", "more", "ls", "tree", "grep", "egrep", "fgrep", "rg",
-    "wc", "stat", "file", "du", "df", "ps", "pgrep", "free", "uptime", "id", "whoami",
+    "cat", "tac", "head", "tail", "more", "ls", "grep", "egrep", "fgrep",
+    "wc", "stat", "du", "df", "ps", "pgrep", "free", "uptime", "id", "whoami",
     "uname", "printenv", "pwd", "echo", "printf", "true", "false", "test", "[",
-    "sha256sum", "sha1sum", "md5sum", "cksum", "sort", "uniq", "cut", "tr", "rev", "jq",
-    "diff", "cmp", "column", "nl", "od", "xxd", "hexdump", "strings", "basename", "dirname",
-    "realpath", "readlink", "which", "type", "sleep", "nproc", "lsof", "netstat", "ss",
-    "getent", "env", "vmstat", "iostat", "dmesg", "cd", "pushd", "popd",
+    "sha256sum", "sha1sum", "md5sum", "cksum", "cut", "tr", "rev", "jq",
+    "diff", "cmp", "column", "nl", "od", "hexdump", "strings", "basename", "dirname",
+    "realpath", "readlink", "which", "type", "sleep", "nproc", "lsof", "netstat",
+    "getent", "env", "vmstat", "iostat", "cd", "pushd", "popd",
 })
+# Environment variables that cannot make a program run other code.
+HARMLESS_ENV = frozenset({"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+                          "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "TZ", "TERM", "COLUMNS",
+                          "LINES", "NO_COLOR", "CLICOLOR", "FORCE_COLOR", "CHANGE_TICKET"})
 LOCAL_ONLY = READ_ONLY | frozenset({
     "git", "cd", "pushd", "popd", "export", "unset", "set", "alias", "read", "shift", "exit",
     "return", "local", "declare", "typeset", "wait", "rm", "cp", "mv", "mkdir", "rmdir",
@@ -110,9 +116,14 @@ FLEET_FORBIDDEN_OPTIONS = {
 _WRITE_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", "<>"})
 _HARMLESS_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
 _SQL_WRITE = re.compile(r"\b(insert|update|delete|drop|create|alter|replace|attach|detach|"
-                        r"vacuum|reindex|analyze|begin|commit|savepoint|release|upsert)\b")
-_SQL_DOT_WRITE = re.compile(r"(^|\s)\.(import|restore|read|output|once|save|backup|shell|"
-                            r"system|load|open|cd|excel|log)\b")
+                        r"vacuum|reindex|analyze|begin|commit|savepoint|release|upsert|"
+                        r"writefile|load_extension|edit|fts3_tokenizer)\b")
+# sqlite3 shell dot-commands that only display things. The shell accepts abbreviations
+# (`.out` is `.output`), so anything else, abbreviated or not, counts as a write.
+_SQL_DOT_READ = frozenset({".tables", ".schema", ".fullschema", ".indexes", ".indices",
+                           ".headers", ".header", ".mode", ".dump", ".databases", ".show",
+                           ".help", ".width", ".nullvalue", ".separator", ".timer", ".print",
+                           ".dbinfo", ".stats", ".eqp", ".echo", ".bail", ".changes"})
 _ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 
 
@@ -547,6 +558,27 @@ _CHDIR_OPTIONS = frozenset({("env", "-C"), ("env", "--chdir"), ("sudo", "-D"),
                             ("sudo", "--chdir")})
 
 
+def _env_split(options: Options) -> tuple[list[Word], str | None]:
+    """`env -S STRING` splits STRING into words (with shell-like quoting) and runs them
+    in place of the option: read it as the start of the command."""
+    words: list[Word] = []
+    for opt, value in options:
+        if opt not in ("-S", "--split-string") or value is None:
+            continue
+        if value.dynamic:
+            return [], "`env -S` with a command line computed at run time"
+        try:
+            commands = parse(value.text)
+        except ValueError:
+            return [], "`env -S` with a string the guard cannot split"
+        if len(commands) > 1 or any(c.redirects for c in commands):
+            return [], "`env -S` passes shell operators on as plain words"
+        for command in commands:
+            words += [Word(f"{k}={v.text}", v.dynamic, v.quoted) for k, v in command.assignments]
+            words += command.words
+    return words, None
+
+
 @dataclass
 class _Run:
     """A simple command with its wrappers peeled off (see `_unwrap`)."""
@@ -587,8 +619,14 @@ def _unwrap(words: list[Word], ticket: str | None, ticket_dynamic: bool) -> _Run
         given = {opt for opt, _ in options}
         run.chdir += [value for opt, value in options
                       if (name, opt) in _CHDIR_OPTIONS and value is not None]
-        if name == "env" and rest and rest[0].text == "-":
-            rest = rest[1:]                 # `env -` is `env -i`
+        if name == "env":
+            if rest and rest[0].text == "-":
+                rest = rest[1:]             # `env -` is `env -i`
+            split, problem = _env_split(options)
+            if problem:
+                run.problem = problem
+                break
+            rest = split + rest             # `env -S 'cmd args'` runs `cmd args`
         if name in ("env", "sudo"):
             while rest and (match := _ASSIGN.match(rest[0].text)):
                 value = Word(rest[0].text[match.end():], rest[0].dynamic, rest[0].quoted)
@@ -625,47 +663,162 @@ def _writes(command: Command) -> bool:
     return False
 
 
+def _options(texts: list[str], values: str = "", long_values: Iterable[str] = ()
+             ) -> tuple[list[tuple[str, str | None]], list[str]]:
+    """A GNU-style command line as (option, value) pairs ("-o", "--output") and operands.
+    `values` are the short options that take a value (attached, or the next word);
+    `long_values` the long ones whose value may be the next word."""
+    long_values = set(long_values)
+    options: list[tuple[str, str | None]] = []
+    operands: list[str] = []
+    i = 0
+    while i < len(texts):
+        text = texts[i]
+        if text == "--":
+            operands += texts[i + 1:]
+            break
+        if text.startswith("--"):
+            name, eq, value = text[2:].partition("=")
+            if not eq and name in long_values and i + 1 < len(texts):
+                i += 1
+                value, eq = texts[i], "="
+            options.append(("--" + name, value if eq else None))
+        elif text.startswith("-") and text != "-":
+            for k in range(1, len(text)):
+                if text[k] in values:
+                    value = text[k + 1:]
+                    if not value and i + 1 < len(texts):
+                        i += 1
+                        value = texts[i]
+                    options.append(("-" + text[k], value))
+                    break
+                options.append(("-" + text[k], None))
+        else:
+            operands.append(text)
+        i += 1
+    return options, operands
+
+
+def _uses(options: list[tuple[str, str | None]], shorts: str, longs: Iterable[str]) -> bool:
+    """Whether any of the short letters or long options is given. A long option counts if
+    it is an abbreviation of one (getopt_long accepts unique prefixes) or a longer variant
+    of one (`--data-urlencode` for `--data`)."""
+    longs = tuple(longs)
+    for name, _ in options:
+        if name.startswith("--"):
+            given = name[2:]
+            if given and any(full.startswith(given) or given.startswith(full)
+                             for full in longs):
+                return True
+        elif name[1:] in shorts:
+            return True
+    return False
+
+
 def _sqlite_read_only(texts: list[str]) -> bool:
-    if any(t in ("-cmd", "-init") for t in texts):
-        return False
-    positional = [t for t in texts if not t.startswith("-")]
+    positional: list[str] = []
+    i = 0
+    while i < len(texts):
+        text = texts[i]
+        if text.startswith("-") and len(text) > 1:
+            name = text.lstrip("-")
+            if name in ("cmd", "init") or name.startswith(("A", "archive")):
+                return False              # commands from elsewhere, or archive mode
+            i += 1 + (name in ("separator", "newline", "nullvalue", "escape", "mmap",
+                               "maxsize", "vfs", "heap"))
+            i += 2 if name in ("lookaside", "pagecache") else 0
+            continue
+        positional.append(text)
+        i += 1
     if len(positional) < 2:
         return False                      # interactive, or SQL arriving on stdin
-    sql = " ".join(positional[1:]).lower()
-    return not (_SQL_WRITE.search(sql) or _SQL_DOT_WRITE.search(sql)
-                or re.search(r"\bpragma\s+\w+\s*[=(]", sql))
+    for statement in positional[1:]:
+        for line in statement.splitlines() or [""]:
+            stripped = line.strip()
+            if stripped.startswith(".") and stripped.split()[0].lower() not in _SQL_DOT_READ:
+                return False
+        sql = statement.lower()
+        if _SQL_WRITE.search(sql) or re.search(r"\bpragma\s+\w+\s*[=(]", sql):
+            return False
+    return True
 
 
-def _curl_writes(text: str) -> bool:
-    long_writes = ("--request", "--data", "--json", "--form", "--upload-file", "--output",
-                   "--remote-name", "--config")
-    if text.startswith("--"):
-        return text.startswith(long_writes)
-    return text.startswith(("-X", "-d", "-F", "-T", "-o", "-O", "-K"))
+_CURL_VALUES = "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+_CURL_WRITE_LONGS = ("request", "data", "json", "form", "upload-file", "output",
+                     "output-dir", "create-dirs", "remote-name", "remote-name-all", "config",
+                     "cookie-jar", "dump-header", "trace", "stderr", "libcurl", "etag-save",
+                     "hsts", "alt-svc")
+
+
+def _curl_read_only(texts: list[str]) -> bool:
+    options, _ = _options(texts, _CURL_VALUES, ("output",))
+    # `-o /dev/null` (a status probe) writes nothing.
+    options = [(n, v) for n, v in options
+               if not (n in ("-o", "--output") and v in (*_HARMLESS_SINKS, "-"))]
+    return not _uses(options, "XdFTOocDK", _CURL_WRITE_LONGS)
+
+
+def _date_read_only(texts: list[str]) -> bool:
+    options, operands = _options(texts, "dfrs", ("date", "file", "reference", "set"))
+    # An operand that is not a +FORMAT sets the clock (`date 101215302026`).
+    return not (_uses(options, "s", ("set",)) or any(not o.startswith("+") for o in operands))
+
+
+def _rule(values: str = "", shorts: str = "", longs: Iterable[str] = (),
+          max_operands: int | None = None, plus_operands: bool = True
+          ) -> Callable[[list[str]], bool]:
+    """A read-only rule: no option among `shorts`/`longs`, at most `max_operands`
+    operands (`uniq IN OUT` writes OUT), and, unless allowed, no `+command` operand."""
+    longs = tuple(longs)
+
+    def read_only(texts: list[str]) -> bool:
+        options, operands = _options(texts, values)
+        if _uses(options, shorts, longs):
+            return False
+        if max_operands is not None and len(operands) > max_operands:
+            return False
+        return plus_operands or not any(o.startswith("+") for o in operands)
+
+    return read_only
+
+
+# Read-only programs that do have options which write, run a program or change state.
+_READ_RULES: Mapping[str, Callable[[list[str]], bool]] = {
+    "sort": _rule("koStT", "o", ("output", "compress-program")),
+    "uniq": _rule("fsw", max_operands=1),
+    "tree": _rule("LPIoHT", "oR"),
+    "xxd": _rule("cglnosR", max_operands=1),
+    "dmesg": _rule("fFlns", "CcDEn", ("clear", "read-clear", "console-off", "console-on",
+                                        "console-level")),
+    "less": _rule("bhjkoOpPtTxyz#", "oO", ("log-file", "LOG-FILE"), plus_operands=False),
+    "rg": _rule("ABCdEefgjMmrtT", "", ("pre", "hostname-bin")),
+    "file": _rule("eFfmP", "C", ("compile",)),
+    "ss": _rule("fAFN", "K", ("kill",)),
+    "hostname": _rule("F", "Fb", ("file", "boot"), max_operands=0),
+    "journalctl": _rule("cDFgMopStTUu", "", ("vacuum-size", "vacuum-time",
+                                                  "vacuum-files", "rotate", "flush", "sync",
+                                                  "relinquish-var", "smart-relinquish-var",
+                                                  "setup-keys", "update-catalog")),
+    "date": _date_read_only,
+    "curl": _curl_read_only,
+    "sqlite3": _sqlite_read_only,
+}
 
 
 def _is_read_only(prog: str, args: list[Word], command: Command) -> bool:
     if _writes(command):
         return False
     texts = _texts(args)
+    rule = _READ_RULES.get(prog)
+    if rule is not None:
+        return rule(texts)
     if prog in READ_ONLY:
         return True
-    if prog == "hostname":
-        return all(t.startswith("-") for t in texts)
-    if prog == "date":
-        return not any(t in ("-s", "--set") or t.startswith("--set=") for t in texts)
     if prog == "find":
         return not any(t in FIND_WRITES for t in texts)
-    if prog == "curl":
-        return not any(_curl_writes(t) for t in texts)
-    if prog == "sqlite3":
-        return _sqlite_read_only(texts)
     if prog == "systemctl":
         verbs = [t for t in texts if not t.startswith("-")]
         return bool(verbs) and verbs[0] in SYSTEMCTL_READ
-    if prog == "journalctl":
-        return not any(t.startswith(("--vacuum", "--rotate", "--flush", "--sync",
-                                     "--relinquish")) for t in texts)
     return False
 
 
@@ -768,6 +921,15 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
     prog = _base(head.text)
     if prog == "busybox" and args:
         prog, args = _base(args[0].text), args[1:]
+    if scope.ctx.kind in ("host", "container"):
+        # LD_PRELOAD, BASH_ENV, LESSOPEN and friends make any program, a read included,
+        # run code of the caller's choosing.
+        risky = sorted(name for name in env if name not in HARMLESS_ENV)
+        if risky:
+            return [scope.mutation(scope.ctx.targets,
+                                   f"`{prog}` runs on {scope.ctx.where} with {', '.join(risky)} "
+                                   "set, and such variables can make any program run other "
+                                   "code")]
     fleet_args: list[Word] | None = args if prog == "fleet-rollout" else None
     if prog in PYTHONS:
         kind, what, after = _python_runs(args)
@@ -986,13 +1148,47 @@ def _docker(args: list[Word], command: Command, scope: Scope, tail: bool) -> lis
     return []
 
 
+def _env_pair(word: Word) -> tuple[str, Word]:
+    name, eq, value = word.text.partition("=")
+    # `-e NAME` passes NAME through from the caller's environment: its value is unknown.
+    return name, Word(value, word.dynamic or not eq, word.quoted)
+
+
 def _docker_exec(rest: list[Word], command: Command, scope: Scope) -> list[Finding]:
+    """`docker exec [options] CONTAINER COMMAND...`. Options are read the way the docker
+    CLI reads them (`-ite NAME=x` is -i, -t and -e NAME=x), and the variables they set
+    go with the command into the container."""
+    env: list[tuple[str, Word]] = []
     i = 0
-    while i < len(rest) and rest[i].text.startswith("-") and rest[i].text != "-":
-        if rest[i].text == "--":
+    while i < len(rest):
+        word, text = rest[i], rest[i].text
+        if text == "--":
             i += 1
             break
-        i += 2 if rest[i].text in EXEC_VALUE else 1
+        if not text.startswith("-") or text == "-":
+            break
+        step = 1
+        if text.startswith("--"):
+            name, eq, attached = text[2:].partition("=")
+            if "--" + name in EXEC_VALUE:
+                value = (Word(attached, word.dynamic, word.quoted) if eq
+                         else rest[i + 1] if i + 1 < len(rest) else None)
+                step = 1 if eq else 2
+                if name == "env" and value is not None:
+                    env.append(_env_pair(value))
+                elif name == "env-file":
+                    env.append(("--env-file", value or Word("", True)))
+        else:
+            for k in range(1, len(text)):
+                if "-" + text[k] in EXEC_VALUE:
+                    attached = text[k + 1:]
+                    value = (Word(attached, word.dynamic, word.quoted) if attached
+                             else rest[i + 1] if i + 1 < len(rest) else None)
+                    step = 1 if attached else 2
+                    if text[k] == "e" and value is not None:
+                        env.append(_env_pair(value))
+                    break
+        i += step
     if i >= len(rest):
         return []
     container, inner = rest[i], rest[i + 1:]
@@ -1010,7 +1206,8 @@ def _docker_exec(rest: list[Word], command: Command, scope: Scope) -> list[Findi
     if not inner:
         return []
     stdin = [r for r in command.redirects if r.op in ("<", "<<", "<<-", "<<<")]
-    return _command(Command(words=list(inner), redirects=stdin), scope.within(ctx))
+    return _command(Command(words=list(inner), assignments=env, redirects=stdin),
+                    scope.within(ctx))
 
 
 def _docker_cp(rest: list[Word], scope: Scope) -> list[Finding]:

@@ -46,7 +46,7 @@ the body, and only the body check caught it.
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
 | **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 657 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 717 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
 
 ## Architecture
 
@@ -153,19 +153,22 @@ id for different content is refused, because "already applied" would then be a l
 unreachable target raises instead of reading as "file absent" (SSH exit 255 and Docker
 exit 125 are transport errors, not answers).
 
-**6. A command guard cannot be a regex.** `docker restart $(docker ps -q)`,
-`ssh host 'sh -c "..."'`, `bash <<EOF`, `sudo env X=1 timeout 5 docker kill …`,
-`DOCKER_HOST=ssh://… docker …`, `find … -exec docker restart {} \;` and
-`echo '...' | bash` all hide the real target. The guard has its own POSIX-shell lexer
+**6. A command guard cannot be a regex.** `docker restart $(docker ps -q)`, `ssh host
+'sh -c "..."'`, `bash <<EOF`, `sudo env X=1 timeout 5 docker kill …`,
+`DOCKER_HOST=ssh://… docker …`, `find … -exec docker restart {} \;` and `echo '...' |
+bash` all hide the real target. The guard has its own POSIX-shell lexer
 ([`guard/shell.py`](src/fleet_rollout/guard/shell.py)): quotes, escapes, operators,
 redirections, heredocs, `$(...)`, backticks and process substitution. It flattens every
 command a script would run, and marks any word whose value is computed at run time. Each
 command is then classified in context (this machine, a non-fleet host, a fleet host,
 inside a fleet container). The classifier strips wrappers and re-parses `ssh` remote
-commands and `sh -c` scripts. It reads local shell scripts from disk before they run, from
-every directory a `cd` (or `env -C`) may have moved the shell into. `fleet-rollout` itself
-is read the way its argparse parser reads it, and the CLI refuses abbreviated options
-(`--fle` for `--fleet`), so the two cannot disagree about what a command line says.
+commands and `sh -c` scripts. It reads local shell scripts from disk before they run,
+from every directory a `cd` (or `env -C`) may have moved the shell into. `fleet-rollout`
+itself is read the way its argparse parser reads it, and the CLI refuses abbreviated
+options (`--fle` for `--fleet`), so the two cannot disagree about what a command line
+says. A read is judged by its arguments too: `sort -o`, `uniq IN OUT` and `xxd -r` write
+files, `curl -sd` posts, `env -S '…'` runs a command, a sqlite3 `writefile()` or `.out`
+writes, and `LD_PRELOAD` (or `BASH_ENV`, `LESSOPEN`) makes any program run other code.
 Anything it cannot name is denied: no ticket can authorize a target nobody can identify.
 
 ## Quick start
@@ -300,6 +303,7 @@ Install it with the settings in [`examples/claude-settings.json`](examples/claud
 | The agent runs | Guard |
 |---|---|
 | `docker ps`, `docker logs agent-02`, `docker exec agent-01 cat …`, `ssh edge-1.example.com 'docker logs agent-01 \| tail'` | allowed (reads) |
+| `docker exec agent-01 sort -o …`, `uniq IN OUT`, `xxd -r`, `curl -sd …`, `env -S '…'`, `sqlite3 db "select writefile(…)"`, or a read run with `LD_PRELOAD=…` | denied: needs a ticket (a read with an option that writes or runs code is a change) |
 | `docker restart agent-01`, `ssh edge-1.example.com reboot`, `scp x edge-1.example.com:/srv/` | denied: needs a ticket |
 | `CHANGE_TICKET=CHG-1042 docker restart agent-01` | allowed if the ticket is valid, unexpired and covers agent-01 |
 | `docker rm -f $(docker ps -aq)`, `for c in …; do docker restart $c; done`, `echo … \| bash` | denied: target computed at run time / script not inspectable |
@@ -320,7 +324,7 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 657 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # 717 tests, under a minute, offline; no Docker, SSH or keys
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```
@@ -341,7 +345,7 @@ all of them on Linux.
 - [`tests/test_rollout.py`](tests/test_rollout.py) drives five fake agents through
   waves, halts, resume, crash recovery from a half-applied target (including one left by
   another patch, and one fixed by hand since), bake checks and ledger write failures.
-- [`tests/test_guard.py`](tests/test_guard.py) is a table of more than 80 real-world
+- [`tests/test_guard.py`](tests/test_guard.py) is a table of more than 200 real-world
   commands with the expected decision, and runs the installed hook entry point as a
   subprocess.
 - [`tests/test_scripts.py`](tests/test_scripts.py) runs the on-target programs for real:

@@ -294,6 +294,111 @@ def test_write_and_edit_tools_cannot_touch_protected_files(project):
     assert ok is None
 
 
+# -- "read-only" programs, read argument by argument ------------------------------------
+
+# Regression: these programs were allowlisted as reads whatever their arguments, so each of
+# these changed a live container without a ticket.
+IN_CONTAINER_WRITES = [
+    "sort -o /srv/agent/config/greeting.txt /dev/null",
+    "sort -uo /srv/agent/config/greeting.txt /dev/null",
+    "sort --output=/srv/agent/config/greeting.txt /dev/null",
+    "sort --out /srv/agent/config/greeting.txt /dev/null",       # getopt accepts prefixes
+    "sort --compress-program=sh /srv/agent/big.txt",
+    "uniq /dev/null /srv/agent/config/greeting.txt",
+    "tree -o /srv/agent/config/greeting.txt /",
+    "tree -R -H . -L 1 /srv/agent",
+    "xxd -r /tmp/x /srv/agent/config/greeting.txt",
+    "xxd /srv/agent/data/settings.db /srv/agent/config/greeting.txt",
+    "dmesg -C",
+    "dmesg --read-clear",
+    "dmesg -n 1",
+    "env -S 'rm -rf /srv'",
+    "env --split-string='rm -rf /srv'",
+    "env -iS'rm -rf /srv'",
+    "curl -sd x http://127.0.0.1:8080/admin",
+    "curl -s -sXPOST http://127.0.0.1:8080/admin",
+    "curl -sO http://127.0.0.1:8080/dump",
+    "curl -c /srv/agent/cookies.txt http://127.0.0.1:8080/",
+    "curl -D /srv/agent/headers.txt http://127.0.0.1:8080/",
+    "curl --data-urlencode a=b http://127.0.0.1:8080/admin",
+    "curl -K /tmp/curl.cfg http://127.0.0.1:8080/",
+    "sqlite3 /srv/agent/db \"select writefile('/srv/agent/x','y')\"",
+    "sqlite3 /srv/agent/db \"select load_extension('/tmp/x.so')\"",
+    "sqlite3 /srv/agent/db .out /srv/agent/x 'select 1'",          # .output, abbreviated
+    "sqlite3 /srv/agent/db '.sh rm -rf /srv'",
+    "sqlite3 -Acf /srv/agent/backup.sqlar /srv/agent",
+    "date 101215302026",                                          # sets the clock
+    "date -us '2026-10-12'",
+    "hostname -F /etc/hostname",
+    "less -o /srv/agent/copy.txt /srv/agent/config/greeting.txt",
+    "less '+!rm -rf /srv' /srv/agent/config/greeting.txt",
+    "rg --pre /tmp/x.sh pattern /srv/agent",
+    "file -C -m /srv/agent/magic",
+    "ss -K dst 127.0.0.1",
+    "journalctl --rot",
+]
+
+
+@pytest.mark.parametrize("inner", IN_CONTAINER_WRITES)
+def test_reads_that_write_need_a_ticket_inside_a_container(project, inner):
+    message = denied(bash(project, f"docker exec agent-01 {inner}"))
+    assert message is not None and "CHANGE_TICKET" in message, message
+    # ssh joins its arguments into one remote command line, so quoting can change what
+    # runs there; it must be denied either way.
+    assert denied(bash(project, f"ssh edge-1.example.com {inner}")) is not None
+
+
+IN_CONTAINER_READS = [
+    "sort -k2,2 -t, /srv/agent/data/report.csv",
+    "sort -rn /srv/agent/data/counts.txt",
+    "uniq -c /srv/agent/logs/app.log",
+    "tree -L 2 /srv/agent",
+    "xxd -l 64 /srv/agent/data/settings.db",
+    "dmesg -T",
+    "env",
+    "curl -fsSL http://127.0.0.1:8080/healthz",
+    "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz",
+    "curl -H 'Accept: application/json' http://127.0.0.1:8080/status",
+    "sqlite3 -readonly /srv/agent/db 'SELECT name, value FROM settings'",
+    "sqlite3 /srv/agent/db .tables",
+    "sqlite3 -header -column /srv/agent/db 'select count(*) from settings'",
+    "date -u +%FT%TZ",
+    "date -d yesterday",
+    "hostname -f",
+    "less /srv/agent/logs/app.log",
+    "rg -n --hidden greeting /srv/agent",
+    "file /srv/agent/data/settings.db",
+    "ss -tlnp",
+    "journalctl -u agent --since today",
+]
+
+
+@pytest.mark.parametrize("inner", IN_CONTAINER_READS)
+def test_plain_reads_inside_a_container_stay_allowed(project, inner):
+    assert bash(project, f"docker exec agent-01 {inner}") is None
+
+
+def test_environment_that_runs_code_turns_a_read_into_a_change(project):
+    # LD_PRELOAD (or BASH_ENV, LESSOPEN, ...) makes any "read" run code of the agent's choice.
+    for command in ("docker exec -e LD_PRELOAD=/srv/agent/x.so agent-01 cat /etc/hostname",
+                    "docker exec -ite FOO=1 agent-01 rm -rf /srv/agent",   # -i -t -e FOO=1
+                    "docker exec --env=LESSOPEN='|rm -rf /srv %s' agent-01 less /etc/hosts",
+                    "docker exec --env-file /tmp/vars agent-01 ls /srv/agent",
+                    "docker exec agent-01 env BASH_ENV=/srv/agent/x.sh cat /etc/hosts",
+                    "ssh edge-1.example.com 'LD_PRELOAD=/tmp/x.so cat /etc/hostname'"):
+        message = denied(bash(project, command))
+        assert message is not None and "CHANGE_TICKET" in message, command
+    assert bash(project, "docker exec -e LANG=C.UTF-8 -e TZ=UTC agent-01 date") is None
+
+
+def test_local_reads_that_write_cannot_reach_protected_files(project):
+    for command in ("sort --output=tickets/CHG-9999.yaml /dev/null",
+                    "uniq notes.txt .fleet-state/approvals.jsonl",
+                    "xxd -r dump.hex fleet.yaml"):
+        message = denied(bash(project, command))
+        assert message is not None and "protected" in message, command
+
+
 # -- protected paths are compared by where they really are -------------------------------
 
 
