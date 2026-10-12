@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import hashlib
+import json
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -60,11 +62,15 @@ LOCAL_ONLY = READ_ONLY | frozenset({
     "touch", "ln", "chmod", "chown", "tee", "tar", "gzip", "gunzip", "zip", "unzip", "ruff",
 })
 
-DOCKER_GLOBAL_VALUE = frozenset({"--context", "-c", "--config", "-l", "--log-level",
-                                 "--tlscacert", "--tlscert", "--tlskey"})
-DOCKER_READ_ONLY = frozenset({"ps", "inspect", "logs", "stats", "top", "port", "diff", "images",
-                              "history", "version", "info", "events", "search", "wait",
-                              "export", "help"})
+# docker's global options that take a value (long names), and the short ones.
+DOCKER_GLOBAL_VALUE = frozenset({"host", "context", "config", "log-level", "tlscacert",
+                                 "tlscert", "tlskey"})
+_DOCKER_GLOBAL_SHORT = {"H": "host", "c": "context", "l": "log-level"}
+# A container ID, or any prefix of one: docker matches IDs by unique prefix.
+_HEX_ID = re.compile(r"[0-9a-f]{1,64}")
+DOCKER_READ_ONLY = frozenset({"ps", "ls", "list", "inspect", "logs", "stats", "top", "port",
+                              "diff", "images", "history", "version", "info", "events",
+                              "search", "wait", "export", "help"})
 DOCKER_MGMT = frozenset({"image", "network", "volume", "system", "plugin", "builder", "buildx",
                          "context", "swarm", "service", "stack", "node", "secret", "config",
                          "manifest", "trust"})
@@ -74,6 +80,19 @@ DOCKER_CREATE = frozenset({"run", "create", "build", "pull", "push", "login", "l
                            "save", "tag", "import"})
 EXEC_VALUE = frozenset({"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir",
                         "--detach-keys"})
+# Options of mutating docker verbs that take a value, so it is not read as a container.
+_STOP_VALUES = frozenset({"-t", "--time", "-s", "--signal"})
+_DOCKER_VERB_VALUES: Mapping[str, frozenset[str]] = {
+    "stop": _STOP_VALUES, "restart": _STOP_VALUES, "kill": frozenset({"-s", "--signal"}),
+    "start": frozenset({"--detach-keys", "--checkpoint", "--checkpoint-dir"}),
+    "attach": frozenset({"--detach-keys"}), "prune": frozenset({"--filter"}),
+    "commit": frozenset({"-a", "--author", "-c", "--change", "-m", "--message"}),
+    "update": frozenset({"--blkio-weight", "--cpu-period", "--cpu-quota", "--cpu-rt-period",
+                         "--cpu-rt-runtime", "-c", "--cpu-shares", "--cpus", "--cpuset-cpus",
+                         "--cpuset-mems", "--kernel-memory", "-m", "--memory",
+                         "--memory-reservation", "--memory-swap", "--pids-limit",
+                         "--restart"}),
+}
 COMPOSE_VALUE = frozenset({"-f", "--file", "-p", "--project-name", "--project-directory",
                            "--profile", "--env-file", "--ansi", "--parallel", "--progress"})
 COMPOSE_READ_ONLY = frozenset({"ps", "logs", "config", "images", "top", "ls", "version", "port",
@@ -145,6 +164,9 @@ class Inventory:
             self._containers.setdefault(t.container.lower(), set()).add(t.name)
             self._containers.setdefault(t.name.lower(), set()).add(t.name)
             self._hosts.setdefault(t.host.lower(), set()).add(t.name)
+        # Targets whose containers run on this machine's own docker daemon.
+        self.local_docker = frozenset(t.name for t in self.targets.values()
+                                      if t.executor == "docker")
         tokens = sorted(set(self._containers) | set(self._hosts), key=len, reverse=True)
         self._mention = re.compile(
             r"(?<![A-Za-z0-9_-])(" + "|".join(re.escape(t) for t in tokens) + r")(?![A-Za-z0-9_-])",
@@ -946,9 +968,7 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
         findings += _protected(prog, args, command, scope)
 
     if prog in DOCKER_CLIS:
-        if "DOCKER_HOST" in env:              # same as `docker -H <host>`
-            scope = replace(scope, ctx=_docker_host(env["DOCKER_HOST"], scope) or scope.ctx)
-        return findings + _docker(args, command, scope, tail)
+        return findings + _docker(args, command, scope, tail, env)
     if prog == "docker-compose":
         return findings + _compose(args, scope, tail)
     if prog == "ssh":
@@ -1082,30 +1102,169 @@ def _find_exec(args: list[Word], scope: Scope) -> list[Finding]:
 # -- docker ----------------------------------------------------------------------------
 
 
-def _docker_host(word: Word, scope: Scope) -> Context | None:
-    if word.dynamic:
-        return None
-    host = _host_of(word.text)
-    targets = scope.inv.by_host(host)
-    return Context("host", targets, f"fleet host {host}") if targets else None
+@dataclass(frozen=True)
+class _Daemon:
+    """The docker daemon a docker command talks to."""
+    kind: str                       # "default" | "fleet" | "other" | "unknown"
+    ctx: Context | None = None      # where it runs, for "fleet" and "other"
+    reason: str = ""                # why it is "unknown"
 
 
-def _docker(args: list[Word], command: Command, scope: Scope, tail: bool) -> list[Finding]:
+def _docker_globals(args: list[Word]) -> tuple[dict[str, Word], list[Word]]:
+    """docker's global options (before the verb) as {name: value}, read the way the
+    docker CLI reads them (`-c ctx`, `--context=ctx`, `-Hhost`), and the words after."""
+    given: dict[str, Word] = {}
     i = 0
     while i < len(args):
-        text = args[i].text
+        word, text = args[i], args[i].text
+        if text == "--":
+            i += 1
+            break
         if not text.startswith("-") or text == "-":
             break
-        if text in ("-H", "--host") and i + 1 < len(args):
-            scope = replace(scope, ctx=_docker_host(args[i + 1], scope) or scope.ctx)
-            i += 2
-        elif text.startswith("--host="):
-            host_word = Word(text.split("=", 1)[1], args[i].dynamic)
-            scope = replace(scope, ctx=_docker_host(host_word, scope) or scope.ctx)
-            i += 1
+        if text.startswith("--"):
+            name, eq, attached = text[2:].partition("=")
+            if name in DOCKER_GLOBAL_VALUE:
+                if eq:
+                    given[name] = Word(attached, word.dynamic, word.quoted)
+                elif i + 1 < len(args):
+                    i += 1
+                    given[name] = args[i]
         else:
-            i += 2 if text in DOCKER_GLOBAL_VALUE else 1
-    rest = args[i:]
+            for k in range(1, len(text)):
+                if text[k] in _DOCKER_GLOBAL_SHORT:
+                    attached = text[k + 1:]
+                    if attached:
+                        value: Word | None = Word(attached, word.dynamic, word.quoted)
+                    else:
+                        value = args[i + 1] if i + 1 < len(args) else None
+                        i += 1
+                    if value is not None:
+                        given[_DOCKER_GLOBAL_SHORT[text[k]]] = value
+                    break
+        i += 1
+    return given, args[i:]
+
+
+def _docker_daemon(given: Mapping[str, Word], env: Mapping[str, Word], scope: Scope) -> _Daemon:
+    """Which daemon a docker command reaches, resolved in the docker CLI's order:
+    --context, -H, DOCKER_HOST, DOCKER_CONTEXT, the config's currentContext, and
+    otherwise the default socket. A context is looked up in docker's own context store;
+    on another machine, or when it cannot be found, the daemon is unknown."""
+    local = scope.ctx.kind == "local"
+
+    def setting(name: str) -> Word | None:     # this command line's, else (here) ours
+        word = env.get(name)
+        if word is None and local and os.environ.get(name):
+            word = Word(os.environ[name])
+        return word if word is not None and (word.text or word.dynamic) else None
+
+    def config_dir() -> Path | None:
+        word = given.get("config") or setting("DOCKER_CONFIG")
+        if word is not None and word.dynamic:
+            return None
+        return Path(os.path.expanduser(word.text)) if word else Path.home() / ".docker"
+
+    context, host = given.get("context"), given.get("host")
+    if context is None and host is None:
+        host = setting("DOCKER_HOST")
+        if host is None:
+            context = setting("DOCKER_CONTEXT")
+            if context is None and local and (config := config_dir()) is not None:
+                context = _current_context(config)
+    if context is not None:
+        if context.dynamic:
+            return _Daemon("unknown", reason="the docker context is computed at run time")
+        if context.text != "default":
+            config = config_dir() if local else None
+            endpoint = _context_endpoint(context.text, config) if config else None
+            if endpoint is None:
+                where = f"in {config}" if config else f"on {scope.ctx.where}"
+                return _Daemon("unknown", reason=f"docker context {context.text!r} is not one "
+                                                 f"the guard can read {where}, so it cannot "
+                                                 "tell which daemon it reaches")
+            host = Word(endpoint)
+        elif host is None:
+            host = setting("DOCKER_HOST")
+    if host is None:
+        return _Daemon("default")
+    if host.dynamic:
+        return _Daemon("unknown", reason="the docker host is computed at run time")
+    return _daemon_at(host.text, scope)
+
+
+def _current_context(config: Path) -> Word | None:
+    try:
+        doc = json.loads((config / "config.json").read_text(encoding="utf-8"))
+        name = doc.get("currentContext") if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+    return Word(name) if isinstance(name, str) and name and name != "default" else None
+
+
+def _context_endpoint(name: str, config: Path) -> str | None:
+    meta = config / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest() / "meta.json"
+    try:
+        host = json.loads(meta.read_text(encoding="utf-8"))["Endpoints"]["docker"]["Host"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return host if isinstance(host, str) else None
+
+
+def _daemon_at(endpoint: str, scope: Scope) -> _Daemon:
+    if endpoint.startswith(("unix://", "npipe://", "fd://")):
+        return _Daemon("default")           # a socket on the machine the command runs on
+    host = _host_of(endpoint)
+    targets = scope.inv.by_host(host)
+    if targets:
+        return _Daemon("fleet", Context("host", targets, f"fleet host {host}"))
+    if host in ("", "localhost", "127.0.0.1", "::1"):
+        return _Daemon("default")
+    return _Daemon("other", Context("remote", frozenset(), f"host {host}"))
+
+
+def _docker_refs(verb: str, rest: list[Word]) -> list[Word]:
+    """The container references of a docker verb: its operands, skipping option values
+    (`stop -t 10` names no container `10`)."""
+    values = _DOCKER_VERB_VALUES.get(verb, frozenset())
+    refs: list[Word] = []
+    i = 0
+    while i < len(rest):
+        text = rest[i].text
+        if text == "--":
+            refs += rest[i + 1:]
+            break
+        if text.startswith("-") and text != "-":
+            i += 2 if text in values else 1
+            continue
+        refs.append(rest[i])
+        i += 1
+    return refs[:1] if verb in ("rename", "commit") else refs
+
+
+def _container_name(text: str) -> str:
+    return text[1:] if text.startswith("/") and len(text) > 1 else text   # `/agent-01` works
+
+
+def _create_refs(rest: list[Word]) -> list[str]:
+    """Containers a `docker run`/`create` attaches to: --volumes-from, container:X."""
+    refs: list[str] = []
+    for i, word in enumerate(rest):
+        text = word.text
+        if text.startswith("--volumes-from"):
+            value = (text.split("=", 1)[1] if "=" in text
+                     else rest[i + 1].text if i + 1 < len(rest) else "")
+            refs.append(value.split(":", 1)[0])
+        refs += re.findall(r"(?:^|=)container:([^\s,]+)", text)
+    return refs
+
+
+def _docker(args: list[Word], command: Command, scope: Scope, tail: bool,
+            env: Mapping[str, Word]) -> list[Finding]:
+    given, rest = _docker_globals(args)
+    daemon = _docker_daemon(given, env, scope)
+    if daemon.ctx is not None:
+        scope = replace(scope, ctx=daemon.ctx)
     if not rest:
         return []
     verb, rest = rest[0].text, rest[1:]
@@ -1113,38 +1272,73 @@ def _docker(args: list[Word], command: Command, scope: Scope, tail: bool) -> lis
         verb, rest = rest[0].text, rest[1:]
     ctx = scope.ctx
     on_fleet_host = ctx.kind in ("host", "container")
+    # This machine's own daemon runs the fleet's `executor: docker` containers.
+    here = (scope.inv.local_docker
+            if ctx.kind == "local" and daemon.kind == "default" else frozenset())
+    unknown = daemon.reason if daemon.kind == "unknown" else None
+
+    def unmatched(ref: str) -> list[Finding]:
+        return [scope.unknown(f"`docker {verb}` names {ref}, which looks like a container ID "
+                              "(or ID prefix): on a daemon that runs fleet containers it "
+                              "cannot be matched to a target; use the container's name")]
+
     if verb == "compose":
-        return _compose(rest, scope, tail)
+        findings = _compose(rest, scope, tail)
+        return [scope.unknown(f"{unknown}; `docker compose` could reach a fleet container")] \
+            if unknown and findings else findings
     if verb in DOCKER_MGMT:
         sub = rest[0].text if rest else ""
         if sub in DOCKER_MGMT_READ:
             return []
+        if unknown:
+            return [scope.unknown(f"{unknown}; `docker {verb} {sub}` could reach a fleet "
+                                  "container")]
         named = scope.inv.mentioned(_texts(rest))
         if named:
             return [scope.mutation(named, f"docker {verb} {sub} names fleet target(s)")]
-        return [scope.mutation(ctx.targets, f"docker {verb} {sub} on {ctx.where}")] \
-            if on_fleet_host else []
+        if on_fleet_host:
+            return [scope.mutation(ctx.targets, f"docker {verb} {sub} on {ctx.where}")]
+        if here:
+            ids = [w.text for w in rest[1:] if _HEX_ID.fullmatch(w.text)]
+            if ids:
+                return unmatched(ids[0])
+            if (verb, sub) == ("system", "prune"):
+                return [scope.mutation(here, "docker system prune removes stopped fleet "
+                                             "containers on this machine too")]
+        return []
     if verb in DOCKER_READ_ONLY:
         return []
     if verb == "exec":
-        return _docker_exec(rest, command, scope)
+        return _docker_exec(rest, command, scope, unknown=unknown, here=here)
     if verb == "cp":
-        return _docker_cp(rest, scope)
+        return _docker_cp(rest, scope, unknown=unknown, here=here)
+    if unknown:
+        return [scope.unknown(f"{unknown}; `docker {verb}` could reach a fleet container")]
     if verb in DOCKER_CREATE:
         named = scope.inv.mentioned(_texts(rest))
         if named:
             return [scope.mutation(named, f"docker {verb} names fleet target(s)")]
-        return [scope.mutation(ctx.targets, f"docker {verb} on {ctx.where}")] \
-            if on_fleet_host else []
-    positional = [w for w in rest if not w.text.startswith("-")]
-    if tail or any(w.dynamic for w in positional):
+        if on_fleet_host:
+            return [scope.mutation(ctx.targets, f"docker {verb} on {ctx.where}")]
+        ids = [r for r in _create_refs(rest) if _HEX_ID.fullmatch(r)] if here else []
+        return unmatched(ids[0]) if ids else []
+    refs = _docker_refs(verb, rest)
+    if tail or any(w.dynamic for w in refs):
         return [scope.unknown(f"`docker {verb}` with a container name computed at run time; "
                               "name the containers explicitly")]
-    named = frozenset().union(*(scope.inv.by_container(w.text) for w in positional))
+    names = [_container_name(w.text) for w in refs]
+    named = frozenset().union(*(scope.inv.by_container(n) for n in names))
     if named:
-        return [scope.mutation(named, f"docker {verb} {' '.join(_texts(positional))}")]
+        return [scope.mutation(named, f"docker {verb} {' '.join(names)}")]
     if on_fleet_host:
         return [scope.mutation(ctx.targets, f"docker {verb} on {ctx.where}")]
+    if here:
+        ids = [n for n in names if _HEX_ID.fullmatch(n)]
+        if ids:
+            return unmatched(ids[0])
+        if not refs:                        # `docker container prune`: every stopped one
+            return [scope.mutation(here, f"docker {verb} on this machine, which runs fleet "
+                                         "containers")]
     return []
 
 
@@ -1154,7 +1348,8 @@ def _env_pair(word: Word) -> tuple[str, Word]:
     return name, Word(value, word.dynamic or not eq, word.quoted)
 
 
-def _docker_exec(rest: list[Word], command: Command, scope: Scope) -> list[Finding]:
+def _docker_exec(rest: list[Word], command: Command, scope: Scope, *, unknown: str | None,
+                 here: frozenset[str]) -> list[Finding]:
     """`docker exec [options] CONTAINER COMMAND...`. Options are read the way the docker
     CLI reads them (`-ite NAME=x` is -i, -t and -e NAME=x), and the variables they set
     go with the command into the container."""
@@ -1194,23 +1389,36 @@ def _docker_exec(rest: list[Word], command: Command, scope: Scope) -> list[Findi
     container, inner = rest[i], rest[i + 1:]
     if container.dynamic:
         return [scope.unknown("`docker exec` into a container computed at run time")]
-    named = scope.inv.by_container(container.text)
+    name = _container_name(container.text)
+    named = scope.inv.by_container(name)
+    stdin = [r for r in command.redirects if r.op in ("<", "<<", "<<-", "<<<")]
+    run = Command(words=list(inner), assignments=env, redirects=stdin)
     if named:
-        ctx = Context("container", named,
-                      f"container {container.text} ({', '.join(sorted(named))})")
+        ctx = Context("container", named, f"container {name} ({', '.join(sorted(named))})")
     elif scope.ctx.kind == "host":
-        ctx = Context("container", scope.ctx.targets,
-                      f"container {container.text} on {scope.ctx.where}")
+        ctx = Context("container", scope.ctx.targets, f"container {name} on {scope.ctx.where}")
+    elif unknown or (here and _HEX_ID.fullmatch(name)):
+        # Which container this is cannot be told. A read in it is still a read; anything
+        # else could be a change to any fleet target.
+        if not inner:
+            return []
+        findings = _command(run, scope.within(Context("container", frozenset(),
+                                                      f"container {name}")))
+        if any(f.kind == "mutation" for f in findings):
+            why = unknown or (f"{name} looks like a container ID (or ID prefix), which cannot "
+                              "be matched to a fleet target on this daemon; use the "
+                              "container's name")
+            return [scope.unknown(f"`docker exec` changes container {name}, and {why}")]
+        return findings
     else:
         return []
     if not inner:
         return []
-    stdin = [r for r in command.redirects if r.op in ("<", "<<", "<<-", "<<<")]
-    return _command(Command(words=list(inner), assignments=env, redirects=stdin),
-                    scope.within(ctx))
+    return _command(run, scope.within(ctx))
 
 
-def _docker_cp(rest: list[Word], scope: Scope) -> list[Finding]:
+def _docker_cp(rest: list[Word], scope: Scope, *, unknown: str | None,
+               here: frozenset[str]) -> list[Finding]:
     positional = [w for w in rest if not w.text.startswith("-")]
     if len(positional) < 2:
         return []
@@ -1225,6 +1433,13 @@ def _docker_cp(rest: list[Word], scope: Scope) -> list[Finding]:
         return [scope.mutation(named, f"docker cp into {head}")]
     if scope.ctx.kind in ("host", "container"):
         return [scope.mutation(scope.ctx.targets, f"docker cp into {head} on {scope.ctx.where}")]
+    if unknown:
+        return [scope.unknown(f"{unknown}; `docker cp` into {head} could reach a fleet "
+                              "container")]
+    if here and _HEX_ID.fullmatch(head):
+        return [scope.unknown(f"`docker cp` into {head}, which looks like a container ID "
+                              "(or ID prefix) on a daemon that runs fleet containers; use "
+                              "the container's name")]
     return []
 
 

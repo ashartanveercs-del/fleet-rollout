@@ -46,7 +46,7 @@ the body, and only the body check caught it.
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
 | **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 717 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 745 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
 
 ## Architecture
 
@@ -153,10 +153,11 @@ id for different content is refused, because "already applied" would then be a l
 unreachable target raises instead of reading as "file absent" (SSH exit 255 and Docker
 exit 125 are transport errors, not answers).
 
-**6. A command guard cannot be a regex.** `docker restart $(docker ps -q)`, `ssh host
-'sh -c "..."'`, `bash <<EOF`, `sudo env X=1 timeout 5 docker kill …`,
-`DOCKER_HOST=ssh://… docker …`, `find … -exec docker restart {} \;` and `echo '...' |
-bash` all hide the real target. The guard has its own POSIX-shell lexer
+**6. A command guard cannot be a regex.** `docker restart $(docker ps -q)`,
+`ssh host 'sh -c "..."'`, `bash <<EOF`, `sudo env X=1 timeout 5 docker kill …`,
+`DOCKER_HOST=ssh://… docker …`, `docker --context edge1 …`,
+`find … -exec docker restart {} \;` and `echo '...' | bash` all hide the real target.
+The guard has its own POSIX-shell lexer
 ([`guard/shell.py`](src/fleet_rollout/guard/shell.py)): quotes, escapes, operators,
 redirections, heredocs, `$(...)`, backticks and process substitution. It flattens every
 command a script would run, and marks any word whose value is computed at run time. Each
@@ -306,6 +307,7 @@ Install it with the settings in [`examples/claude-settings.json`](examples/claud
 | `docker exec agent-01 sort -o …`, `uniq IN OUT`, `xxd -r`, `curl -sd …`, `env -S '…'`, `sqlite3 db "select writefile(…)"`, or a read run with `LD_PRELOAD=…` | denied: needs a ticket (a read with an option that writes or runs code is a change) |
 | `docker restart agent-01`, `ssh edge-1.example.com reboot`, `scp x edge-1.example.com:/srv/` | denied: needs a ticket |
 | `CHANGE_TICKET=CHG-1042 docker restart agent-01` | allowed if the ticket is valid, unexpired and covers agent-01 |
+| `docker --context edge1 restart 3f2a…`, `DOCKER_CONTEXT=… docker …`, or `docker restart 3f2a…` on a daemon that runs `executor: docker` targets | the context is looked up in docker's own context store: a fleet host needs a ticket; a context it cannot read, or a container ID (or ID prefix) it cannot match to a target, is denied |
 | `docker rm -f $(docker ps -aq)`, `for c in …; do docker restart $c; done`, `echo … \| bash` | denied: target computed at run time / script not inspectable |
 | `fleet-rollout apply … --ticket CHG-1042` | allowed if the ticket covers every selected target |
 | `fleet-rollout approve …`, `fleet-rollout clear-halt …`, `fleet-rollout rollback … --force` | denied: those are human decisions |
@@ -324,7 +326,7 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 717 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # 745 tests, under a minute, offline; no Docker, SSH or keys
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```
@@ -357,8 +359,9 @@ all of them on Linux.
 - **The guard is a guardrail, not a sandbox.** It inspects the command line, and the
   shell scripts that line runs from disk. It cannot see inside a Python program or a
   Makefile. A program it does not understand is allowed unless it names a fleet target,
-  host or container (`python manage.py restart agent-02` is denied). The real boundary
-  is credentials: an agent session should not hold production SSH keys or a production
+  host or container (`python manage.py restart agent-02` is denied). It knows fleet
+  hosts by the names in the fleet file, not by IP address. The real boundary is
+  credentials: an agent session should not hold production SSH keys or a production
   Docker socket. Pair the hook with OS permissions that make the tickets and state
   directories read-only to the agent's user.
 - **Protected paths are matched where they really are:** symlinks and junctions are

@@ -1,5 +1,6 @@
 """The PreToolUse guard, driven through its real entry point with hook payloads."""
 
+import hashlib
 import io
 import json
 import os
@@ -40,7 +41,11 @@ TICKETS = {
 
 
 @pytest.fixture
-def project(tmp_path):
+def project(tmp_path, monkeypatch):
+    # The guard reads docker's context store; never let the developer's own leak in.
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "docker-config"))
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
     (tmp_path / "fleet.yaml").write_text(FLEET)
     tickets = tmp_path / "tickets"
     tickets.mkdir()
@@ -292,6 +297,95 @@ def test_write_and_edit_tools_cannot_touch_protected_files(project):
     ok = hook(project, {"tool_name": "Write", "cwd": str(project),
                         "tool_input": {"file_path": "src/app.py", "content": "x"}})
     assert ok is None
+
+
+# -- which docker daemon, which container ------------------------------------------------
+
+
+def docker_context(project, name, host, *, current=False):
+    """A docker CLI context, stored the way `docker context create` stores it."""
+    config = project / "docker-config"
+    meta = config / "contexts" / "meta" / hashlib.sha256(name.encode()).hexdigest()
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "meta.json").write_text(json.dumps(
+        {"Name": name, "Metadata": {}, "Endpoints": {"docker": {"Host": host}}}))
+    if current:
+        (config / "config.json").write_text(json.dumps({"currentContext": name}))
+
+
+DOCKER_ENDPOINT_DENY = [
+    # Regression: --context/-c and DOCKER_CONTEXT were skipped without asking where they
+    # point, so a mutation addressed by container ID reached a fleet host unchecked.
+    ("docker --context edge1 restart 3f2ab1c9d0e4", "CHANGE_TICKET"),
+    ("DOCKER_CONTEXT=edge1 docker exec 3f2ab1c9d0e4 rm -rf /srv/agent", "CHANGE_TICKET"),
+    ("docker -c edge1 exec 3f2ab1c9d0e4 rm -rf /srv/agent", "CHANGE_TICKET"),
+    ("docker --context=edge1 rm -f 3f2ab1c9d0e4", "CHANGE_TICKET"),
+    ("docker --context nosuch restart 3f2ab1c9d0e4", "context"),
+    ("docker --context $CTX restart 3f2ab1c9d0e4", "computed at run time"),
+    ("DOCKER_HOST=$H docker restart 3f2ab1c9d0e4", "computed at run time"),
+    ("docker --config /tmp/elsewhere --context edge1 restart 3f2a", "context"),
+    ("ssh build.example.org docker --context edge1 restart 3f2a", "context"),
+    ("docker restart /agent-01", "agent-01"),             # docker accepts a leading slash
+    ("docker exec /agent-01 rm -rf /srv/agent", "agent-01"),
+]
+
+
+@pytest.mark.parametrize("command, reason", DOCKER_ENDPOINT_DENY)
+def test_docker_contexts_are_resolved_before_judging_a_container(project, command, reason):
+    docker_context(project, "edge1", "ssh://ops@edge-1.example.com")
+    message = denied(bash(project, command))
+    assert message is not None and reason in message, message
+
+
+def test_a_context_pointing_away_from_the_fleet_is_not_the_guards_business(project):
+    docker_context(project, "build", "ssh://ci@build.example.org")
+    docker_context(project, "local", "unix:///var/run/docker.sock")
+    assert bash(project, "docker --context build restart 3f2ab1c9d0e4") is None
+    assert bash(project, "docker --context local restart my-postgres") is None
+    assert bash(project, "docker --context build ps") is None
+
+
+def test_the_current_context_in_the_docker_config_counts_too(project):
+    docker_context(project, "edge1", "ssh://ops@edge-1.example.com", current=True)
+    assert "CHANGE_TICKET" in denied(bash(project, "docker restart 3f2ab1c9d0e4"))
+    assert "CHANGE_TICKET" in denied(bash(project, "docker system prune -af"))
+
+
+LOCAL_FLEET = FLEET.replace("executor: ssh", "executor: docker")
+
+LOCAL_DOCKER_DENY = [
+    "docker restart 3f2ab1c9d0e4",              # an ID may be any fleet container here
+    "docker rm -f 3f2a",
+    "docker kill -s HUP 3f2ab1c9d0e4",
+    "docker exec 3f2ab1c9d0e4 rm -rf /srv/agent",
+    "docker cp x.txt 3f2ab1c9d0e4:/srv/agent/x.txt",
+    "docker run --rm --volumes-from 3f2a alpine rm -rf /srv/agent",
+    "docker container prune -f",                # removes stopped fleet containers too
+    "docker system prune -af",
+]
+
+
+@pytest.mark.parametrize("command", LOCAL_DOCKER_DENY)
+def test_container_ids_on_a_daemon_that_runs_fleet_containers_are_denied(project, command):
+    (project / "fleet.yaml").write_text(LOCAL_FLEET)
+    assert denied(bash(project, command)) is not None, command
+
+
+LOCAL_DOCKER_ALLOW = [
+    "docker restart my-postgres",               # a name is matched exactly, never by prefix
+    "docker stop -t 10 my-postgres",            # `10` is the timeout, not a container
+    "docker exec 3f2ab1c9d0e4 cat /etc/hostname",
+    "docker logs --tail 20 3f2ab1c9d0e4",
+    "docker container ls",
+    "docker ps -q",
+    "CHANGE_TICKET=CHG-1042 docker stop -t 10 agent-01",
+]
+
+
+@pytest.mark.parametrize("command", LOCAL_DOCKER_ALLOW)
+def test_names_reads_and_option_values_on_a_fleet_daemon_stay_allowed(project, command):
+    (project / "fleet.yaml").write_text(LOCAL_FLEET)
+    assert bash(project, command) is None, command
 
 
 # -- "read-only" programs, read argument by argument ------------------------------------
