@@ -374,6 +374,72 @@ def test_an_interrupted_transaction_is_undone_from_its_log_before_anything_else(
     assert "r-crashed" in recovered.detail
 
 
+def test_another_patchs_interrupted_transaction_must_be_undone_first(tmp_path):
+    # Regression: recovery only looked at the patch being run, so once the dead run's lock
+    # was broken, any other patch backed up the half-applied files as its own "pre-state"
+    # and the interrupted transaction stayed `started` forever.
+    env = Env(tmp_path)
+    hotfix = make_patch(tmp_path / "hotfix", [{"kind": "write_file",
+                                               "source": "files/greeting.txt",
+                                               "dest": "config/greeting.txt"}],
+                        files={"files/greeting.txt": GREETING_V2}, pid="greeting-hotfix")
+    crashed_state(env, patch=hotfix)
+    env.clock.advance(hours=3)
+    break_lock(env.fleet, "agent-01", executor_for=env.executor_for, state=env.state,
+               operator="ops.oncall", ticket=env.ticket(), now=env.clock())
+    calls = {n: len(fx.calls) for n, fx in env.agents.items()}
+    report = env.run(run_id="r-next")
+    assert not report.ok and report.refused
+    assert "greeting-hotfix" in report.aborted and "r-crashed" in report.aborted
+    assert {n: len(fx.calls) for n, fx in env.agents.items()} == calls   # nothing touched
+    assert not [e for e in env.events(run="r-next")]                    # refused up front
+    with pytest.raises(RolloutError, match="interrupted"):
+        rollback_target(env.fleet, env.patch, "agent-01", executor_for=env.executor_for,
+                        state=env.state, operator="ops.oncall", ticket=env.ticket(),
+                        clock=env.clock, sleep=lambda s: None)
+    undo = rollback_target(env.fleet, hotfix, "agent-01", executor_for=env.executor_for,
+                           state=env.state, operator="ops.oncall", ticket=env.ticket(),
+                           clock=env.clock, sleep=lambda s: None)
+    assert undo.ok and env.greeting("agent-01") == ORIGINAL
+    report = env.run(run_id="r-then")
+    assert report.ok, report.aborted
+    assert env.greeting("agent-01") == GREETING_V2
+
+
+def test_an_interruption_mid_transaction_restores_and_is_ledgered(tmp_path):
+    # Regression: only KeyboardInterrupt restored. Any other BaseException (SystemExit from
+    # a signal handler, say) skipped the restore while both locks were still released, so
+    # the next run saw no stale lock and no reason to recover anything.
+    env = Env(tmp_path, steps=[
+        {"kind": "write_file", "source": "files/greeting.txt", "dest": "config/greeting.txt"},
+        {"kind": "append_block", "source": "files/rule.md", "dest": "prompts/support.md",
+         "marker": "<!-- rule: refunds-v2 -->"}],
+        files={"files/greeting.txt": GREETING_V2,
+               "files/rule.md": b"- Refunds over $50 need a manager.\n"})
+    fx = env.agents["agent-01"]
+    real_rename = fx.rename
+    renames = {"n": 0}
+
+    def dies_after_the_second_swap(src, dst):
+        real_rename(src, dst)
+        renames["n"] += 1
+        if renames["n"] == 2:
+            raise SystemExit("terminated")
+
+    fx.rename = dies_after_the_second_swap
+    with pytest.raises(SystemExit):
+        env.run(run_id="r-dies")
+    fx.rename = real_rename
+    assert env.greeting("agent-01") == ORIGINAL
+    assert fx.files[f"{ROOT}/prompts/support.md"] == WORKSPACE["prompts/support.md"]
+    record = env.state.ledger().target_states(env.patch.id)["agent-01"]
+    assert record.event == "rolled_back" and "SystemExit" in record.detail
+    assert ("run_aborted", None) in env.events(run="r-dies")
+    assert env.state.ledger().halt_record(env.patch.id) is None   # stopped, not failed
+    assert lock_path(ROOT) not in fx.files and not (env.state.root / "run.lock").exists()
+    assert env.run().ok
+
+
 def test_recovery_does_not_overwrite_a_target_fixed_by_hand_after_the_crash(tmp_path):
     env = Env(tmp_path)
     crashed_state(env)

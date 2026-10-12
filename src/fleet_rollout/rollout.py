@@ -247,6 +247,11 @@ class Rollout:
             report.aborted = (f"the ledger could not be written ({exc}); stopping. Targets "
                               "already handled keep the state the ledger shows for them")
             return report
+        except BaseException as exc:
+            if not isinstance(exc, Exception):          # Ctrl-C, SystemExit, ...
+                with contextlib.suppress(Exception):
+                    self._log("run_aborted", detail=f"interrupted by {type(exc).__name__}")
+            raise
         finally:
             run_lock.release(self.run_id)
 
@@ -266,13 +271,19 @@ class Rollout:
             return self._refuse(report, f"the ledger already records {self.patch.id} with "
                                         "different content; a patch id must never be reused "
                                         "for new content, so give this change a new id")
-        self._log("run_started", detail=f"{len(self.plan.targets)} target(s) in "
-                                        f"{len(self.plan.waves)} wave(s)")
         states = self.ledger.target_states(self.patch.id)
         planned = {t.name for t in self.plan.targets}
         # `skipped` means "already had it": a later run must keep treating it as done.
         done = {n for n, r in states.items()
                 if r.event in ("verified", "skipped") and r.digest == self.patch.digest}
+        # Another patch's half-done transaction would be backed up as this patch's
+        # "pre-state" and then never undone. It must be dealt with first.
+        foreign = [r for r in self.ledger.interrupted()
+                   if r.patch != self.patch.id and r.target in planned - done]
+        if foreign:
+            return self._refuse(report, _interrupted_message(foreign))
+        self._log("run_started", detail=f"{len(self.plan.targets)} target(s) in "
+                                        f"{len(self.plan.waves)} wave(s)")
         interrupted = {n: r.run for n, r in states.items()
                        if r.event == "started" and n in planned}
 
@@ -332,7 +343,11 @@ class Rollout:
                                     f"{target.name} ({exc}); nothing was changed on it")
                 return None
             tx = self._tx(target)
-            outcome = tx.apply()
+            try:
+                outcome = tx.apply()
+            except BaseException as exc:    # interrupted: apply() restored before re-raising
+                self._log_interrupted(target, tx.interrupted, exc)
+                raise
             if outcome.ok:
                 detail = outcome.health.detail if outcome.health else "applied"
                 try:
@@ -358,6 +373,18 @@ class Rollout:
             # If this fails the lock goes stale and the next preflight reports it.
             with contextlib.suppress(ExecutorError):
                 release(executor, target.root, self.run_id)
+
+    def _log_interrupted(self, target: Target, restore: RestoreReport | None,
+                         exc: BaseException) -> None:
+        """Give an interrupted transaction its terminal record, so the ledger never shows
+        `started` for a target that was put back. A clean restore is `rolled_back` without
+        a halt (the run was stopped, the patch did not fail); anything less halts."""
+        clean = restore is not None and restore.ok
+        detail = (f"interrupted by {type(exc).__name__}; "
+                  f"{restore.detail if restore else 'no restore ran'}")
+        with contextlib.suppress(Exception):   # the interruption is what must propagate
+            self._log("rolled_back" if clean else "rollback_failed", target.name, detail,
+                      halt=not clean)
 
     def _recover(self, target: Target, old_run: str, report: RolloutReport) -> bool:
         """Undo a transaction a crashed run left half-done, from its backup log."""
@@ -417,6 +444,15 @@ class Rollout:
 # -- operator actions outside a rollout ------------------------------------------------
 
 
+def _interrupted_message(records: Sequence[LedgerRecord]) -> str:
+    found = "; ".join(f"{r.target} has an interrupted transaction of {r.patch} from run "
+                      f"{r.run}" for r in records)
+    first = records[0]
+    return (f"{found}. Undo it before anything else touches that target: `fleet-rollout "
+            f"rollback {first.patch}.yaml --target {first.target}` restores its recorded "
+            "pre-state (re-running that patch's apply also recovers it first)")
+
+
 def rollback_target(fleet: Fleet, patch: Patch, target_name: str, *,
                     executor_for: ExecutorFactory, state: StateDir, operator: str,
                     ticket: Ticket, clock: Clock, sleep: Callable[[float], None] = time.sleep,
@@ -436,6 +472,10 @@ def rollback_target(fleet: Fleet, patch: Patch, target_name: str, *,
     if problem:
         raise RolloutError(problem)
     ledger = state.ledger()
+    foreign = [r for r in ledger.interrupted()
+               if r.target == target.name and r.patch != patch.id]
+    if foreign:
+        raise RolloutError(_interrupted_message(foreign))
     runs = [r.run for r in ledger.records()
             if r.patch == patch.id and r.target == target.name and r.event == "started"]
     if not runs:

@@ -135,6 +135,9 @@ class TargetTransaction:
         self.min_free_bytes = min_free_bytes
         self._root_real: str | None = None
         self._recorded: list[BackupEntry] = []
+        # Set when apply() was interrupted (Ctrl-C, SystemExit, ...): the restore it ran
+        # before letting the interruption propagate.
+        self.interrupted: RestoreReport | None = None
 
     @property
     def root(self) -> str:
@@ -384,6 +387,7 @@ class TargetTransaction:
     def apply(self) -> TargetOutcome:
         manifest = self.store.manifest(self.run_id, self.target.name)
         self._recorded = []
+        self.interrupted = None
         reports: list[StepReport] = []
         label = "workspace"
         health: HealthResult | None = None
@@ -402,9 +406,6 @@ class TargetTransaction:
             self._verify_assertions()
             label = "applied marker"
             self._write_marker()
-        except KeyboardInterrupt:
-            self.restore(self._recorded)
-            raise
         except Exception as exc:  # any failure at all must end in a restore
             failed = exc.label if isinstance(exc, StepFailed) else label
             detail = str(exc) if isinstance(exc, StepFailed | ExecutorError | BackupCorrupt) \
@@ -412,6 +413,9 @@ class TargetTransaction:
             reports.append(StepReport(failed, False, detail))
             return TargetOutcome(self.target.name, False, tuple(reports), failed, detail,
                                  self.restore(self._recorded), health)
+        except BaseException:     # Ctrl-C, SystemExit, ...: undo first, then let it go on
+            self.interrupted = self.restore(self._recorded)
+            raise
         return TargetOutcome(self.target.name, True, tuple(reports), health=health)
 
     def restore(self, entries: Iterable[BackupEntry], *, force: bool = False) -> RestoreReport:

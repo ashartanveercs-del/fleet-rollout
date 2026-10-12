@@ -9,7 +9,8 @@ writer cannot edit (a ticket, a CI log) and compare.
 The ledger also drives behaviour, not just audit: a `halt` record freezes further runs
 of that patch until someone appends an explicit `halt_cleared`; targets whose latest
 record is `verified` are skipped on resume; and a `started` record without a terminal
-record marks an interrupted transaction that must be undone first.
+record marks an interrupted transaction that must be undone before any patch touches
+that target again.
 """
 
 from __future__ import annotations
@@ -169,6 +170,15 @@ class Ledger:
                     and record.event in TRANSACTION_EVENTS):
                 latest[record.target] = record
         return latest
+
+    def interrupted(self) -> list[LedgerRecord]:
+        """The `started` record of every transaction, of any patch, that never reached a
+        terminal record: work a dead run left half done on that target."""
+        latest: dict[tuple[str, str], LedgerRecord] = {}
+        for record in self.records():
+            if record.patch and record.target and record.event in TRANSACTION_EVENTS:
+                latest[(record.patch, record.target)] = record
+        return [r for r in latest.values() if r.event == "started"]
 
     def digests_for(self, patch_id: str) -> set[str]:
         return {r.digest for r in self.records() if r.patch == patch_id and r.digest}

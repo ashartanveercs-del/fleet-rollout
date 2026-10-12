@@ -126,6 +126,18 @@ def test_audit_only_events_do_not_change_a_targets_transaction_state(ledger):
     assert ledger.target_states("support-greeting-v2")["agent-01"].event == "started"
 
 
+def test_interrupted_transactions_across_every_patch(ledger):
+    add(ledger, "started", "agent-01", patch="greeting-v2")
+    add(ledger, "verified", "agent-01", patch="greeting-v2")
+    add(ledger, "started", "agent-02", patch="greeting-v2")
+    add(ledger, "started", "agent-01", patch="invoice-v3")
+    add(ledger, "lock_broken", "agent-01", patch="invoice-v3")
+    add(ledger, "started", "agent-03", patch="invoice-v3")
+    add(ledger, "manual_rollback", "agent-03", patch="invoice-v3")
+    assert sorted((r.patch, r.target) for r in ledger.interrupted()) == [
+        ("greeting-v2", "agent-02"), ("invoice-v3", "agent-01")]
+
+
 def test_digests_seen_for_a_patch(ledger):
     add(ledger, "started", "agent-01", digest="a" * 64)
     add(ledger, "verified", "agent-01", digest="a" * 64)

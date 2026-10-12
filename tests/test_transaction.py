@@ -183,21 +183,24 @@ def test_a_failed_verify_assertion_rolls_back(tmp_path):
     assert live(fx, "config/greeting.txt") == WORKSPACE["config/greeting.txt"]
 
 
-def test_ctrl_c_mid_transaction_restores_then_propagates(tmp_path):
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_an_interruption_mid_transaction_restores_then_propagates(tmp_path, interruption):
     fx = agent()
     before = fx.snapshot()
     original_rename = fx.rename
 
     def interrupted(src, dst):
         if dst.endswith("prompts/faq.md"):
-            raise KeyboardInterrupt
+            raise interruption
         original_rename(src, dst)
 
     fx.rename = interrupted
-    with pytest.raises(KeyboardInterrupt):
-        tx(tmp_path, fx, three_step_patch(tmp_path, b"ok = 1\n")).apply()
+    t = tx(tmp_path, fx, three_step_patch(tmp_path, b"ok = 1\n"))
+    with pytest.raises(interruption):
+        t.apply()
     fx.rename = original_rename
     assert fx.snapshot() == before
+    assert t.interrupted is not None and t.interrupted.ok
 
 
 # -- honest partial restores --------------------------------------------------------------
