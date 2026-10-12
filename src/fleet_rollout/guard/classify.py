@@ -22,8 +22,8 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from ..fleet import Fleet
@@ -85,9 +85,18 @@ FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 SYSTEMCTL_READ = frozenset({"status", "is-active", "is-enabled", "is-failed", "list-units",
                             "list-unit-files", "show", "cat", "list-timers",
                             "list-dependencies"})
-FLEET_CLI_VALUE_OPTIONS = frozenset({"--fleet", "--state", "--canary", "--operator", "--bake",
-                                     "--reason", "--approver", "--note", "--ttl-hours",
-                                     "--run"})
+# The options of every fleet-rollout verb that touches targets, and whether each takes a
+# value. The CLI refuses abbreviations, so the guard reads exactly what the CLI will.
+FLEET_CLI_OPTIONS: Mapping[str, Mapping[str, bool]] = {
+    "apply": {"--fleet": True, "--state": True, "--targets": True, "--canary": True,
+              "--include-customer": False, "--ticket": True, "--operator": True,
+              "--allow-drift": False, "--bake": True},
+    "rollback": {"--fleet": True, "--state": True, "--target": True, "--ticket": True,
+                 "--operator": True, "--include-customer": False},
+    "unlock": {"--fleet": True, "--state": True, "--run-lock": False, "--ticket": True,
+               "--operator": True},
+}
+FLEET_CLI_MODULES = frozenset({"fleet_rollout", "fleet_rollout.cli", "fleet_rollout.__main__"})
 FLEET_FORBIDDEN = {
     "approve": "approvals must be recorded by people, not by an agent session",
     "clear-halt": "clearing a halt is a human decision, made after investigating why the "
@@ -106,10 +115,13 @@ _ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 
 
 class Inventory:
-    """What the guard knows about the fleet: names, containers, hosts, protected paths."""
+    """What the guard knows about the fleet: names, containers, hosts, protected paths, and
+    the fleet file it protects (the only one a `fleet-rollout` mutation may use)."""
 
-    def __init__(self, fleet: Fleet | None, protected: Iterable[Path] = ()) -> None:
+    def __init__(self, fleet: Fleet | None, protected: Iterable[Path] = (), *,
+                 fleet_file: Path | None = None) -> None:
         self.fleet = fleet
+        self.fleet_file = fleet_file
         self.targets = {t.name: t for t in fleet.targets} if fleet else {}
         self._containers: dict[str, set[str]] = {}
         self._hosts: dict[str, set[str]] = {}
@@ -183,11 +195,19 @@ class Finding:
 @dataclass(frozen=True)
 class Scope:
     inv: Inventory
-    cwd: Path
+    # Every directory the shell may be in when a command runs: the payload's cwd, plus
+    # each place a `cd` in the script may have moved to. The guard does not model control
+    # flow, so it treats them all as possible (`cwd_unknown`: a move computed at run time).
+    cwds: tuple[Path, ...]
     ctx: Context = LOCAL
     ticket: str | None = None
     ticket_dynamic: bool = False
     depth: int = 0
+    cwd_unknown: bool = False
+
+    @property
+    def cwd(self) -> Path:
+        return self.cwds[0]
 
     def mutation(self, targets: Iterable[str], reason: str) -> Finding:
         return Finding("mutation", reason, frozenset(targets), self.ticket, self.ticket_dynamic)
@@ -199,17 +219,32 @@ class Scope:
         return replace(self, ctx=ctx, depth=self.depth + 1)
 
     def classify(self, script: str) -> list[Finding]:
-        return classify(script, self.inv, cwd=self.cwd, ctx=self.ctx, ticket=self.ticket,
-                        ticket_dynamic=self.ticket_dynamic, depth=self.depth + 1)
+        return _classify(script, replace(self, depth=self.depth + 1))
+
+    def locate(self, text: str) -> list[Path] | None:
+        """Where a local path would point from every directory the shell may be in; None
+        when a relative path follows a change of directory computed at run time."""
+        path = Path(os.path.expanduser(text))
+        if path.is_absolute():
+            return [path]
+        if self.cwd_unknown:
+            return None
+        return [Path(os.path.normpath(cwd / path)) for cwd in self.cwds]
 
 
 def classify(script: str, inv: Inventory, *, cwd: Path, ctx: Context = LOCAL,
              ticket: str | None = None, ticket_dynamic: bool = False,
              depth: int = 0) -> list[Finding]:
     """Findings for every command in `script`. Raises ShellSyntaxError if unparseable."""
-    scope = Scope(inv, Path(cwd), ctx, ticket, ticket_dynamic, depth)
+    return _classify(script, Scope(inv, (Path(cwd),), ctx, ticket, ticket_dynamic, depth))
+
+
+def _classify(script: str, scope: Scope) -> list[Finding]:
+    commands = parse(script, depth=scope.depth)
+    if scope.ctx.kind == "local":
+        scope = _follow_cd(commands, scope)
     findings: list[Finding] = []
-    for command in parse(script, depth=depth):
+    for command in commands:
         findings.extend(_command(command, scope))
     return findings
 
@@ -217,14 +252,81 @@ def classify(script: str, inv: Inventory, *, cwd: Path, ctx: Context = LOCAL,
 def only_reads(script: str) -> bool:
     """True if every command in `script` is a plain read (used when the fleet is unknown)."""
     for command in parse(script):
-        words = _unwrap(list(command.words), None, False)[0]
-        if not words:
+        run = _unwrap(list(command.words), None, False)
+        if run.problem or run.chdir or run.cwd_unknown:
+            return False
+        if not run.words:
             if _writes(command):
                 return False
             continue
+        words = run.words
         if words[0].dynamic or not _is_read_only(_base(words[0].text), words[1:], command):
             return False
     return True
+
+
+# -- the working directory ---------------------------------------------------------------
+
+MAX_CWDS = 16
+
+
+def _follow_cd(commands: Sequence[Command], scope: Scope, depth: int = 0) -> Scope:
+    """Add every directory `cd`/`pushd` may move the shell into, wherever it appears in the
+    script (a subshell's `cd` is counted too: over-approximating is the safe direction).
+    A sourced or eval'd script runs in the same shell, so its moves count as well."""
+    cwds, unknown = list(scope.cwds), scope.cwd_unknown
+    cdpath = bool(os.environ.get("CDPATH")) or any(
+        "CDPATH" in w.text for c in commands for w in c.words) or any(
+        name == "CDPATH" for c in commands for name, _ in c.assignments)
+    for command in commands:
+        run = _unwrap(list(command.words), None, False)
+        if not run.words or run.words[0].dynamic:
+            continue
+        name, args = _base(run.words[0].text), run.words[1:]
+        if name in ("cd", "pushd", "popd", "chdir"):
+            operands = [a for a in args if not re.fullmatch(r"-[LPe@n]+|[+-]\d+", a.text)]
+            operands = operands[1:] if operands and operands[0].text == "--" else operands
+            if name == "popd" or (name == "pushd" and not operands):
+                continue                    # back to a directory already counted
+            target = operands[0] if operands else Word("~")
+            if target.dynamic or target.text == "-":
+                unknown = True
+                continue
+            path = Path(os.path.expanduser(target.text))
+            relative = not path.is_absolute()
+            if relative and cdpath and not target.text.startswith("."):
+                unknown = True              # CDPATH may resolve it anywhere
+                continue
+            for cwd in list(cwds) if relative else [None]:
+                moved = Path(os.path.normpath(cwd / path if cwd is not None else path))
+                if moved not in cwds:
+                    cwds.append(moved)
+        elif name in (".", "source") and args and depth < 4:
+            for text in _read_script(args[0], replace(scope, cwds=tuple(cwds))) or ():
+                with contextlib.suppress(ValueError):          # ShellSyntaxError
+                    inner = _follow_cd(parse(text), replace(scope, cwds=tuple(cwds)), depth + 1)
+                    cwds.extend(c for c in inner.cwds if c not in cwds)
+                    unknown = unknown or inner.cwd_unknown
+        elif name == "eval" and args and not any(a.dynamic for a in args) and depth < 4:
+            with contextlib.suppress(ValueError):
+                inner = _follow_cd(parse(" ".join(_texts(args))), replace(scope, cwds=tuple(cwds)),
+                                   depth + 1)
+                cwds.extend(c for c in inner.cwds if c not in cwds)
+                unknown = unknown or inner.cwd_unknown
+    if len(cwds) > MAX_CWDS:
+        unknown = True
+    return replace(scope, cwds=tuple(cwds), cwd_unknown=unknown)
+
+
+def _chdir(scope: Scope, run: _Run) -> Scope:
+    """The scope of one command that a wrapper runs in another directory (`env -C`)."""
+    if run.cwd_unknown or any(w.dynamic for w in run.chdir):
+        return replace(scope, cwd_unknown=True)
+    cwds = scope.cwds
+    for word in run.chdir:
+        path = Path(os.path.expanduser(word.text))
+        cwds = tuple(Path(os.path.normpath(c / path)) for c in cwds)
+    return replace(scope, cwds=tuple(dict.fromkeys(cwds)))
 
 
 # -- helpers ---------------------------------------------------------------------------
@@ -251,51 +353,188 @@ def _skip_options(words: list[Word], value_opts: frozenset[str] | set[str]) -> l
     return words[i:]
 
 
-def _unwrap(words: list[Word], ticket: str | None, ticket_dynamic: bool
-            ) -> tuple[list[Word], bool, str | None, bool, dict[str, Word]]:
-    """Strip shell keywords and wrapper programs (sudo, env, timeout, xargs, ...).
-    Returns the remaining words, whether arguments get appended at run time (xargs), the
-    change ticket, and the environment variables `env` assigned on the way."""
-    tail_dynamic = False
-    env: dict[str, Word] = {}
-    while words:
-        head = words[0]
+Options = list[tuple[str, Word | None]]
+
+
+def _getopt(words: list[Word], short: str, longs: Mapping[str, str]
+            ) -> tuple[Options, list[Word], str | None]:
+    """Leading options, read the way GNU getopt_long reads a wrapper's command line: short
+    flags may be clustered (`-iC dir`, `-Cdir`), long ones take `=value` or the next word,
+    and a long option may be abbreviated to any unambiguous prefix (`--ch` is `--chdir`).
+    Options stop at the first operand. `short` is a getopt string ("C:iS:u:", `::` for an
+    optional attached value); `longs` maps names to "", ":" or "::" the same way.
+    Returns the options, the remaining words and, for a command line the wrapper itself
+    would refuse, the reason."""
+    spec: dict[str, str] = {}
+    letters = short.lstrip("+")
+    k = 0
+    while k < len(letters):
+        end = k + 1
+        while end < len(letters) and letters[end] == ":":
+            end += 1
+        spec[letters[k]] = letters[k + 1:end]
+        k = end
+    options: Options = []
+    i = 0
+    while i < len(words):
+        word, text = words[i], words[i].text
+        if text == "--":
+            return options, words[i + 1:], None
+        if text.startswith("--"):
+            name, eq, attached = text[2:].partition("=")
+            matches = [name] if name in longs else [n for n in longs if n.startswith(name)]
+            if len(matches) != 1:
+                return options, words[i:], f"unrecognized or ambiguous option {text.split('=')[0]}"
+            kind = longs[matches[0]]
+            value: Word | None = None
+            if eq:
+                if not kind:
+                    return options, words[i:], f"{text} does not take a value"
+                value = Word(attached, word.dynamic, word.quoted)
+            elif kind == ":":
+                if i + 1 >= len(words):
+                    return options, [], f"{text} needs a value"
+                i += 1
+                value = words[i]
+            options.append(("--" + matches[0], value))
+            i += 1
+            continue
+        if not text.startswith("-") or text == "-":
+            break
+        for k in range(1, len(text)):
+            letter = text[k]
+            if letter not in spec:
+                return options, words[i:], f"unrecognized option -{letter}"
+            if not spec[letter]:
+                options.append(("-" + letter, None))
+                continue
+            rest = text[k + 1:]
+            if rest:
+                options.append(("-" + letter, Word(rest, word.dynamic, word.quoted)))
+            elif spec[letter] == ":":
+                if i + 1 >= len(words):
+                    return options, [], f"-{letter} needs a value"
+                i += 1
+                options.append(("-" + letter, words[i]))
+            else:
+                options.append(("-" + letter, None))
+            break
+        i += 1
+    return options, words[i:], None
+
+
+# Programs that run another command: (getopt string, long options). See `_unwrap`.
+_WRAPPERS: Mapping[str, tuple[str, Mapping[str, str]]] = {
+    "sudo": ("+Aa:BbC:c:D:Eeg:Hh::iKklNnPp:R:r:SsT:t:U:u:Vv",
+             {"askpass": "", "auth-type": ":", "background": "", "bell": "", "close-from": ":",
+              "login-class": ":", "chdir": ":", "preserve-env": "::", "edit": "", "group": ":",
+              "set-home": "", "help": "", "host": ":", "login": "", "remove-timestamp": "",
+              "reset-timestamp": "", "list": "", "no-update": "", "non-interactive": "",
+              "preserve-groups": "", "prompt": ":", "chroot": ":", "role": ":", "stdin": "",
+              "shell": "", "type": ":", "command-timeout": ":", "other-user": ":",
+              "user": ":", "version": "", "validate": ""}),
+    "doas": ("+C:Lnsu:", {}),
+    "env": ("+C:iS:u:v0", {"chdir": ":", "ignore-environment": "", "split-string": ":",
+                           "unset": ":", "debug": "", "null": "", "block-signal": "::",
+                           "default-signal": "::", "ignore-signal": "::",
+                           "list-signal-handling": "", "help": "", "version": ""}),
+    "nohup": ("+", {"help": "", "version": ""}),
+    "command": ("+pvV", {}),
+    "builtin": ("+", {}),
+    "exec": ("+cla:", {}),
+    "setsid": ("+cfwhV", {"ctty": "", "fork": "", "wait": "", "help": "", "version": ""}),
+    "chronic": ("+ev", {}),
+    "unbuffer": ("+p", {}),
+    "stdbuf": ("+i:o:e:", {"input": ":", "output": ":", "error": ":", "help": "",
+                           "version": ""}),
+    "nice": ("+n:", {"adjustment": ":", "help": "", "version": ""}),
+    "ionice": ("+c:n:p:P:tu:hV", {"class": ":", "classdata": ":", "pid": ":", "pgid": ":",
+                                  "ignore": "", "uid": ":", "help": "", "version": ""}),
+    "timeout": ("+fk:ps:v", {"foreground": "", "kill-after": ":", "preserve-status": "",
+                             "signal": ":", "verbose": "", "help": "", "version": ""}),
+    "watch": ("+bcCd::eghn:pq:rtvwx", {"beep": "", "color": "", "no-color": "",
+                                       "differences": "::", "errexit": "", "chgexit": "",
+                                       "equexit": ":", "interval": ":", "precise": "",
+                                       "no-rerun": "", "no-title": "", "no-wrap": "",
+                                       "exec": "", "help": "", "version": ""}),
+    "xargs": ("+0a:E:e::hi::I:l::L:n:prs:txP:d:",
+              {"null": "", "arg-file": ":", "delimiter": ":", "eof": "::", "replace": "::",
+               "max-lines": "::", "max-args": ":", "open-tty": "", "interactive": "",
+               "no-run-if-empty": "", "max-chars": ":", "verbose": "", "show-limits": "",
+               "exit": "", "max-procs": ":", "process-slot-var": ":", "help": "",
+               "version": ""}),
+}
+_CHDIR_OPTIONS = frozenset({("env", "-C"), ("env", "--chdir"), ("sudo", "-D"),
+                            ("sudo", "--chdir")})
+
+
+@dataclass
+class _Run:
+    """A simple command with its wrappers peeled off (see `_unwrap`)."""
+    words: list[Word]
+    tail_dynamic: bool = False          # xargs appends arguments at run time
+    ticket: str | None = None
+    ticket_dynamic: bool = False
+    env: dict[str, Word] = field(default_factory=dict)
+    chdir: list[Word] = field(default_factory=list)   # env -C / sudo -D, outermost first
+    cwd_unknown: bool = False           # sudo -i: a login shell starts in a home directory
+    problem: str | None = None          # a wrapper command line the guard cannot read
+
+
+def _unwrap(words: list[Word], ticket: str | None, ticket_dynamic: bool) -> _Run:
+    """Strip shell keywords and wrapper programs (sudo, env, timeout, xargs, ...), keeping
+    what they change about the command they run: the change ticket and other variables
+    they assign, the directory they run it in, and arguments appended at run time."""
+    run = _Run(list(words), ticket=ticket, ticket_dynamic=ticket_dynamic)
+    while run.words:
+        head = run.words[0]
         name = _base(head.text)
         if head.text in RESERVED and not head.quoted:
-            words = words[1:]
-        elif name in HEADERS:
-            return [], tail_dynamic, ticket, ticket_dynamic, env
-        elif name in ("sudo", "doas"):
-            words = _skip_options(words[1:], {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t",
-                                              "-U", "-T"})
-        elif name == "env":
-            words = _skip_options(words[1:], {"-u", "-C", "-S", "--unset", "--chdir"})
-            while words and (match := _ASSIGN.match(words[0].text)):
-                value = Word(words[0].text[match.end():], words[0].dynamic, words[0].quoted)
-                env[match.group(1)] = value
-                if match.group(1) == "CHANGE_TICKET":
-                    ticket, ticket_dynamic = value.text, value.dynamic
-                words = words[1:]
-        elif name in ("nohup", "command", "builtin", "exec", "setsid", "chronic", "unbuffer"):
-            words = _skip_options(words[1:], set())
-        elif name == "stdbuf":
-            words = _skip_options(words[1:], {"-i", "-o", "-e"})
-        elif name == "nice":
-            words = _skip_options(words[1:], {"-n", "--adjustment"})
-        elif name == "ionice":
-            words = _skip_options(words[1:], {"-c", "-n", "-p", "-P", "-u"})
-        elif name == "timeout":
-            words = _skip_options(words[1:], {"-s", "-k", "--signal", "--kill-after"})[1:]
-        elif name == "watch":
-            words = _skip_options(words[1:], {"-n", "--interval"})
-        elif name == "xargs":
-            words = _skip_options(words[1:], {"-I", "-n", "-P", "-L", "-d", "-a", "-E", "-s",
-                                              "--max-args", "--max-procs", "--delimiter",
-                                              "--arg-file", "--replace"})
-            tail_dynamic = True
-        else:
+            run.words = run.words[1:]
+            continue
+        if name in HEADERS:
+            run.words = []
             break
-    return words, tail_dynamic, ticket, ticket_dynamic, env
+        if head.dynamic or name not in _WRAPPERS:
+            break
+        args = run.words[1:]
+        if name == "nice" and args and re.fullmatch(r"-[-+]?\d+", args[0].text):
+            args = args[1:]                 # the historical `nice -10 cmd`
+        short, longs = _WRAPPERS[name]
+        options, rest, problem = _getopt(args, short, longs)
+        if problem:
+            run.problem = f"`{name}`: {problem}"
+            break
+        given = {opt for opt, _ in options}
+        run.chdir += [value for opt, value in options
+                      if (name, opt) in _CHDIR_OPTIONS and value is not None]
+        if name == "env" and rest and rest[0].text == "-":
+            rest = rest[1:]                 # `env -` is `env -i`
+        if name in ("env", "sudo"):
+            while rest and (match := _ASSIGN.match(rest[0].text)):
+                value = Word(rest[0].text[match.end():], rest[0].dynamic, rest[0].quoted)
+                run.env[match.group(1)] = value
+                if match.group(1) == "CHANGE_TICKET":
+                    run.ticket, run.ticket_dynamic = value.text, value.dynamic
+                rest = rest[1:]
+        if name == "sudo":
+            if given & {"-R", "--chroot"}:
+                run.problem = "`sudo --chroot` runs the command against another root directory"
+                break
+            if given & {"-i", "--login"}:
+                run.cwd_unknown = True
+            if given & {"-e", "--edit"}:
+                rest = [Word("sudoedit"), *rest]
+            elif not rest and given & {"-s", "--shell", "-i", "--login"}:
+                rest = [Word("sh")]         # an interactive shell, reading from stdin
+        if name == "doas" and not rest and "-s" in given:
+            rest = [Word("sh")]
+        if name == "timeout":
+            rest = rest[1:]                 # the duration
+        if name == "xargs":
+            run.tail_dynamic = True
+        run.words = rest
+    return run
 
 
 def _writes(command: Command) -> bool:
@@ -369,17 +608,58 @@ def _remote_host(text: str) -> str | None:
     return head.rsplit("@", 1)[-1].lower()
 
 
-def _read_script(word: Word, cwd: Path) -> str | None:
+def _read_script(word: Word, scope: Scope) -> list[str] | None:
+    """The text of a local script as the shell would find it from each directory it may be
+    in. None if it cannot be read, or its location depends on a run-time `cd`."""
     if word.dynamic:
         return None
-    path = Path(word.text)
-    path = path if path.is_absolute() else cwd / path
-    try:
-        if path.stat().st_size > MAX_SCRIPT_BYTES:
-            return None
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    places = scope.locate(word.text)
+    if places is None:
         return None
+    texts = []
+    for path in places:
+        try:
+            if path.stat().st_size > MAX_SCRIPT_BYTES:
+                return None
+            texts.append(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue                        # not there, so it cannot run from there either
+        except (OSError, UnicodeDecodeError):
+            return None
+    return texts or None
+
+
+def _is_shell_script(text: str) -> bool:
+    return text.startswith("#!") and any(shell in text.splitlines()[0] for shell in SHELLS)
+
+
+def _python_runs(args: list[Word]) -> tuple[str, Word | None, list[Word]]:
+    """What a python command line runs: ("module" | "code" | "script" | "stdin", the
+    module, code or script word, the arguments after it)."""
+    i = 0
+    while i < len(args):
+        word, text = args[i], args[i].text
+        if text == "-" or not text.startswith("-"):
+            return ("stdin", None, args[i + 1:]) if text == "-" else ("script", word, args[i + 1:])
+        if text == "--":
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            return ("script", nxt, args[i + 2:]) if nxt else ("stdin", None, [])
+        if text.startswith("--"):
+            i += 2 if text == "--check-hash-based-pycs" else 1
+            continue
+        for k in range(1, len(text)):
+            letter = text[k]
+            if letter in "cmXW":
+                attached = text[k + 1:]
+                value = (Word(attached, word.dynamic, word.quoted) if attached
+                         else args[i + 1] if i + 1 < len(args) else None)
+                after = args[i + 1:] if attached else args[i + 2:]
+                if letter in "cm":
+                    return ("code" if letter == "c" else "module"), value, after
+                i += 0 if attached else 1
+                break
+        i += 1
+    return "stdin", None, []
 
 
 # -- one simple command --------------------------------------------------------------------
@@ -390,11 +670,14 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
     for name, value in command.assignments:
         if name == "CHANGE_TICKET":
             ticket, ticket_dynamic = value.text, value.dynamic
-    words, tail, ticket, ticket_dynamic, env = _unwrap(list(command.words), ticket,
-                                                       ticket_dynamic)
-    env = {**dict(command.assignments), **env}
-    scope = replace(scope, ticket=None if ticket_dynamic else ticket,
-                    ticket_dynamic=ticket_dynamic)
+    run = _unwrap(list(command.words), ticket, ticket_dynamic)
+    if run.problem:
+        return [scope.unknown(f"{run.problem}, so the guard cannot tell what it runs")]
+    words, tail, env = run.words, run.tail_dynamic, {**dict(command.assignments), **run.env}
+    scope = replace(scope, ticket=None if run.ticket_dynamic else run.ticket,
+                    ticket_dynamic=run.ticket_dynamic)
+    if run.chdir or run.cwd_unknown:
+        scope = _chdir(scope, run)
     if not words:
         if scope.ctx.kind in ("host", "container") and _writes(command):
             return [scope.mutation(scope.ctx.targets, f"a redirection writes on {scope.ctx.where}")]
@@ -406,11 +689,19 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
     prog = _base(head.text)
     if prog == "busybox" and args:
         prog, args = _base(args[0].text), args[1:]
-    fleet_cli = prog == "fleet-rollout" or (
-        prog in PYTHONS and _texts(args[:2]) == ["-m", "fleet_rollout"])
+    fleet_args: list[Word] | None = args if prog == "fleet-rollout" else None
+    if prog in PYTHONS:
+        kind, what, after = _python_runs(args)
+        if kind == "module" and what is not None and what.dynamic:
+            return [scope.unknown("the module python runs is computed at run time")]
+        if kind == "module" and what is not None and what.text in FLEET_CLI_MODULES:
+            fleet_args = after
+        elif kind == "code" and what is not None and "fleet_rollout" in what.text:
+            return [scope.unknown("python code that drives fleet_rollout directly cannot be "
+                                  "inspected; run the `fleet-rollout` CLI instead")]
 
     findings: list[Finding] = []
-    if scope.ctx.kind == "local" and not fleet_cli:
+    if scope.ctx.kind == "local" and fleet_args is None:
         findings += _protected(prog, args, command, scope)
 
     if prog in DOCKER_CLIS:
@@ -423,8 +714,11 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
         return findings + _ssh(args, command, scope)
     if prog in ("scp", "rsync", "sftp"):
         return findings + _transfer(prog, args, scope)
-    if fleet_cli:
-        return findings + _fleet_cli(args[2:] if prog in PYTHONS else args, scope)
+    if fleet_args is not None:
+        if tail:
+            return findings + [scope.unknown("`fleet-rollout` with arguments appended at run "
+                                             "time")]
+        return findings + _fleet_cli(fleet_args, scope)
     if prog in SHELLS or prog in (".", "source"):
         return findings + _shell(prog, args, command, scope)
     if prog == "eval":
@@ -436,15 +730,18 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
         return findings if scope.ctx.kind in ("local", "remote") or not _writes(command) else (
             findings + [scope.mutation(scope.ctx.targets, f"find writes on {scope.ctx.where}")])
     if "/" in head.text and scope.ctx.kind == "local":
-        content = _read_script(head, scope.cwd)
-        if content is not None and content.startswith("#!") and any(
-                shell in content.splitlines()[0] for shell in SHELLS):
-            return findings + scope.classify(content)
+        scripts = [text for text in _read_script(head, scope) or () if _is_shell_script(text)]
+        if scripts:
+            return findings + [f for text in scripts for f in scope.classify(text)]
     if _is_read_only(prog, args, command):
         return findings
     if scope.ctx.kind in ("local", "remote"):
         if scope.ctx.kind == "local" and prog in LOCAL_ONLY:
             return findings
+        if any(_base(w.text) == "fleet-rollout" for w in args):
+            return findings + [scope.unknown(
+                f"`{prog}` runs fleet-rollout in a way the guard cannot inspect; run "
+                "`fleet-rollout ...` directly")]
         named = scope.inv.mentioned(_texts(words))
         if named:
             findings.append(scope.mutation(named, f"`{prog}` is not a program the guard "
@@ -474,6 +771,9 @@ def _find_exec(args: list[Word], scope: Scope) -> list[Finding]:
     i = 0
     while i < len(args):
         if args[i].text in FIND_EXEC:
+            # -execdir/-okdir run the command in the directory of each match.
+            inner_scope = (replace(scope, cwd_unknown=True)
+                           if args[i].text in ("-execdir", "-okdir") else scope)
             inner: list[Word] = []
             i += 1
             while i < len(args) and args[i].text not in (";", "+"):
@@ -481,7 +781,7 @@ def _find_exec(args: list[Word], scope: Scope) -> list[Finding]:
                 inner.append(Word(word.text, True, word.quoted) if "{}" in word.text else word)
                 i += 1
             if inner:
-                findings += _command(Command(words=inner), scope)
+                findings += _command(Command(words=inner), inner_scope)
         i += 1
     return findings
 
@@ -747,10 +1047,13 @@ def _shell(prog: str, args: list[Word], command: Command, scope: Scope) -> list[
         if scope.ctx.kind in ("host", "container"):
             return [scope.mutation(scope.ctx.targets,
                                    f"running a script file on {scope.ctx.where}")]
-        content = _read_script(files[0], scope.cwd) if scope.ctx.kind == "local" else None
-        if content is None:
-            return [scope.unknown(f"cannot read the script `{files[0].text}` to inspect it")]
-        return scope.classify(content)
+        texts = _read_script(files[0], scope) if scope.ctx.kind == "local" else None
+        if texts is None:
+            where = (" (it is relative to a directory computed at run time)"
+                     if scope.cwd_unknown else "")
+            return [scope.unknown(f"cannot read the script `{files[0].text}` to inspect "
+                                  f"it{where}")]
+        return [f for text in texts for f in scope.classify(text)]
     bodies = [r for r in command.redirects if r.op in ("<<", "<<-", "<<<")]
     if bodies:
         findings: list[Finding] = []
@@ -766,49 +1069,117 @@ def _shell(prog: str, args: list[Word], command: Command, scope: Scope) -> list[
                           "inspected; run the commands directly")]
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    with contextlib.suppress(OSError):
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    return (os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b)))
+
+
 def _fleet_cli(args: list[Word], scope: Scope) -> list[Finding]:
-    sub = args[0].text if args else ""
+    """`fleet-rollout <verb> ...`, read the way its argparse parser reads it. A verb that
+    touches targets must use the fleet file the guard protects and that fleet's state
+    directory: anything else could name targets, tickets, approvals or halts of its own."""
+    if not args:
+        return []
+    if args[0].dynamic:
+        return [scope.unknown("the `fleet-rollout` subcommand is computed at run time")]
+    sub = args[0].text
+    if sub in ("-h", "--help", "--version"):
+        return []                           # prints and exits
+    if sub.startswith("-"):
+        return [scope.unknown(f"`fleet-rollout {sub}` is not an option the guard knows")]
     if sub in FLEET_FORBIDDEN:
         return [Finding("forbidden", f"`fleet-rollout {sub}`: {FLEET_FORBIDDEN[sub]}")]
-    if sub not in ("apply", "rollback", "unlock"):
-        return []                          # read-only verbs; unknown ones fail in the CLI
-    rest = args[1:]
-    ticket, ticket_dynamic = scope.ticket, scope.ticket_dynamic
-    names: list[str] | None = None
-    include_customer = False
+    known = FLEET_CLI_OPTIONS.get(sub)
+    if known is None:
+        return []                           # read-only verbs; unknown ones fail in the CLI
+    given: dict[str, Word | None] = {}      # the last occurrence wins, as in argparse
     positional: list[Word] = []
+    rest = args[1:]
     i = 0
     while i < len(rest):
         word, text = rest[i], rest[i].text
-        value = rest[i + 1] if i + 1 < len(rest) else None
-        if text in ("--ticket", "--targets", "--target") and value is not None:
-            if value.dynamic:
-                return [scope.unknown(f"`fleet-rollout {sub} {text}` computed at run time")]
-            if text == "--ticket":
-                ticket, ticket_dynamic = value.text, False
+        if text == "--":
+            positional += rest[i + 1:]
+            break
+        if text in ("-h", "--help"):
+            return []
+        if text.startswith("-") and text != "-":
+            name, eq, attached = text.partition("=")
+            if name not in known:
+                return [scope.unknown(f"`fleet-rollout {sub} {name}` is not an option the guard "
+                                      "knows; spell options out in full")]
+            if not known[name]:
+                if eq:
+                    return []               # argparse refuses a value for a flag
+                given[name] = None
             else:
-                names = (names or []) + [n for n in value.text.split(",") if n]
-            i += 2
-            continue
-        if text in FLEET_CLI_VALUE_OPTIONS:
-            i += 2                          # e.g. --fleet fleet.yaml: the value is no target
-            continue
-        if text.startswith("--ticket="):
-            ticket, ticket_dynamic = text.split("=", 1)[1], word.dynamic
-        elif text.startswith(("--targets=", "--target=")):
-            names = (names or []) + [n for n in text.split("=", 1)[1].split(",") if n]
-        elif text == "--include-customer":
-            include_customer = True
-        elif not text.startswith("-"):
+                if eq:
+                    value = Word(attached, word.dynamic, word.quoted)
+                elif i + 1 < len(rest):
+                    i += 1
+                    value = rest[i]
+                else:
+                    return []               # argparse: expected one argument
+                if value.dynamic:
+                    return [scope.unknown(f"`fleet-rollout {sub} {name}` computed at run time")]
+                given[name] = value
+        else:
             positional.append(word)
         i += 1
+    pinned = _fleet_cli_pinned(sub, given, scope)
+    if pinned:
+        return [pinned]
     if sub == "unlock":                     # no target: the state directory's own lock
         if positional and positional[0].dynamic:
             return [scope.unknown("`fleet-rollout unlock` of a target computed at run time")]
         names = [positional[0].text] if positional else []
-    if names is None:
-        names = [t.name for t in scope.inv.targets.values()
-                 if include_customer or not t.customer_owned]
-    targets = frozenset(n for n in names if n in scope.inv.targets)
-    return [Finding("mutation", f"fleet-rollout {sub}", targets,
+    elif sub == "rollback":
+        target = given.get("--target")
+        names = [target.text] if target is not None else []
+    else:
+        raw = given.get("--targets")
+        names = ([n.strip() for n in raw.text.split(",") if n.strip()]
+                 if raw is not None and raw.text else
+                 [t.name for t in scope.inv.targets.values()
+                  if "--include-customer" in given or not t.customer_owned])
+    strangers = sorted(n for n in names if n not in scope.inv.targets)
+    if strangers:
+        return [scope.unknown(f"`fleet-rollout {sub}` names {', '.join(strangers)}, which the "
+                              "fleet file the guard protects does not list")]
+    ticket_word = given.get("--ticket")
+    ticket, ticket_dynamic = ((ticket_word.text, False) if ticket_word is not None
+                              else (scope.ticket, scope.ticket_dynamic))
+    return [Finding("mutation", f"fleet-rollout {sub}", frozenset(names),
                     None if ticket_dynamic else ticket, ticket_dynamic)]
+
+
+def _fleet_cli_pinned(sub: str, given: Mapping[str, Word | None], scope: Scope
+                      ) -> Finding | None:
+    inv = scope.inv
+    if scope.ctx.kind != "local":
+        return scope.unknown(f"`fleet-rollout {sub}` on {scope.ctx.where} would read a fleet "
+                             "file the guard cannot see; run it from this machine")
+    if inv.fleet is None or inv.fleet_file is None:
+        return scope.unknown("the guard does not know which fleet file it protects")
+    fleet_word = given.get("--fleet") or Word("fleet.yaml")
+    places = scope.locate(fleet_word.text)
+    if places is None:
+        return scope.unknown(f"`fleet-rollout {sub}` reads the fleet file `{fleet_word.text}` "
+                             "from a working directory computed at run time; pass --fleet "
+                             f"{inv.fleet_file}")
+    stray = next((p for p in places if not _same_file(p, inv.fleet_file)), None)
+    if stray is not None:
+        return scope.unknown(f"`fleet-rollout {sub}` would read the fleet file {stray}, not "
+                             f"{inv.fleet_file}, the one the guard protects; another fleet "
+                             "file can name its own targets, tickets and state directory")
+    state_word = given.get("--state")
+    if state_word is not None:
+        places = scope.locate(state_word.text)
+        if places is None or any(not _same_file(p, inv.fleet.state_dir) for p in places):
+            return Finding("forbidden", f"`fleet-rollout {sub} --state {state_word.text}`: "
+                                        "approvals, halts and the ledger live in the state "
+                                        f"directory {inv.fleet.state_dir}; a {sub} pointed at "
+                                        "another state directory would skip them")
+    return None

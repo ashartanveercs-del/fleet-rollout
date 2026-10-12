@@ -233,10 +233,52 @@ def test_bad_input_is_reported_not_raised(project, argv, message):
     assert code in (2, 3) and message in err
 
 
-def test_the_state_directory_can_be_overridden(project, tmp_path_factory):
-    state = tmp_path_factory.mktemp("elsewhere")
+def test_commands_that_write_state_always_use_the_fleets_state_dir(project, tmp_path_factory):
+    # Regression: `apply --state <dir>` read approvals from, checked halts in, and wrote the
+    # ledger to whatever directory it was given, so two forged approvals in a private
+    # directory patched a customer-owned target and the real ledger never saw it.
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    as_ops = ["--operator", "ops.oncall"]
+    for argv in (["apply", project.patch, "--ticket", "CHG-1042", "--include-customer", *as_ops],
+                 ["rollback", project.patch, "--target", "agent-02", "--ticket", "CHG-1042",
+                  *as_ops],
+                 ["unlock", "agent-02", "--ticket", "CHG-1042", *as_ops],
+                 ["unlock", "--run-lock", "--ticket", "CHG-1042", *as_ops],
+                 ["approve", project.patch, "--target", "agent-03", "--approver", "eng.lead",
+                  "--note", "looks right"],
+                 ["clear-halt", "greeting-v2", "--reason", "fixed", *as_ops]):
+        code, _, err = project.run(*argv, "--fleet", project.fleet_file,
+                                   "--state", str(elsewhere))
+        assert code == 2 and "state directory" in err, (argv, err)
+    assert list(elsewhere.iterdir()) == []
+    assert all(not agent.mutations for agent in project.agents.values())
+
+
+def test_the_fleets_own_state_dir_may_be_named_explicitly(project):
     code, _, _ = project.run("apply", project.patch, "--fleet", project.fleet_file,
                              "--ticket", "CHG-1042", "--operator", "ops.oncall",
-                             "--state", str(state))
-    assert code == 0 and (state / "ledger.jsonl").is_file()
-    assert not (project.root / "state" / "ledger.jsonl").exists()
+                             "--state", str(project.root / "state"))
+    assert code == 0 and (project.root / "state" / "ledger.jsonl").is_file()
+
+
+def test_read_only_commands_can_inspect_another_state_dir(project, tmp_path_factory):
+    project.run("apply", project.patch, "--fleet", project.fleet_file, "--ticket", "CHG-1042",
+                "--operator", "ops.oncall")
+    copy = tmp_path_factory.mktemp("copy") / "state"
+    copy.mkdir()
+    (copy / "ledger.jsonl").write_bytes((project.root / "state" / "ledger.jsonl").read_bytes())
+    code, out, _ = project.run("status", project.patch, "--fleet", project.fleet_file,
+                               "--state", str(copy))
+    assert code == 0 and "verified" in out
+    code, out, _ = project.run("ledger", "verify", "--fleet", project.fleet_file,
+                               "--state", str(copy))
+    assert code == 0 and "ledger OK" in out
+
+
+def test_long_options_must_be_spelled_out(project):
+    # argparse accepts unique prefixes by default (`--fle` for `--fleet`), which let a
+    # command line say one thing to a reviewer or the guard and another to the CLI.
+    code, _, err = project.run("apply", project.patch, "--fle", project.fleet_file,
+                               "--ticket", "CHG-1042", "--operator", "ops.oncall")
+    assert code == 2 and "--fle" in err
+    assert all(not agent.mutations for agent in project.agents.values())

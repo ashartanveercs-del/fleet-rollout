@@ -45,6 +45,17 @@ from .validation import ValidationError, person_name, target_name
 
 EXIT_OK, EXIT_FAILED, EXIT_INVALID, EXIT_REFUSED = 0, 1, 2, 3
 
+# Commands that append to the ledger or the approvals, or act on what they say.
+_STATE_WRITERS = frozenset({"apply", "rollback", "unlock", "approve", "clear-halt"})
+_STATE_READERS = frozenset({"plan", "status", "ledger", "locks"})
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    def key(p: Path) -> str:
+        return os.path.normcase(os.path.realpath(os.path.abspath(p)))
+
+    return key(a) == key(b)
+
 
 class _UsageError(Exception):
     pass
@@ -57,7 +68,15 @@ class _Exit(Exception):
 
 
 class _Parser(argparse.ArgumentParser):
-    """argparse that reports errors to main() instead of exiting the interpreter."""
+    """argparse that reports errors to main() instead of exiting the interpreter.
+
+    Long options must be spelled out: argparse would otherwise accept any unique prefix
+    (`--fle` for `--fleet`), so a command line could mean one thing to a reviewer or to
+    the guard hook and another to the CLI. Subcommand parsers inherit this class."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
 
     def error(self, message: str) -> Any:
         raise _UsageError(f"{self.prog}: {message}")
@@ -76,7 +95,9 @@ def _parser() -> _Parser:
     def fleet_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--fleet", type=Path, default=Path("fleet.yaml"),
                        help="fleet file (default: ./fleet.yaml)")
-        p.add_argument("--state", type=Path, help="state directory (default: from the fleet file)")
+        p.add_argument("--state", type=Path,
+                       help="state directory to read (default: the fleet file's state_dir); "
+                            "commands that write state always use the fleet file's")
 
     def selection(p: argparse.ArgumentParser) -> None:
         p.add_argument("--targets", help="comma-separated subset of targets (default: all)")
@@ -169,7 +190,20 @@ class _Ctx:
         return self._fleet
 
     def state(self) -> StateDir:
-        return StateDir(self.args.state or self.fleet().state_dir)
+        declared = self.fleet().state_dir
+        chosen = self.args.state
+        if chosen is None or _same_path(chosen, declared):
+            return StateDir(declared)
+        if self.args.command in _STATE_WRITERS:
+            # Approvals, halts and the ledger live in the state directory. A mutation pointed
+            # at another one would read approvals nobody reviewed, ignore halts and leave the
+            # real audit trail without a record of what it changed.
+            raise ValidationError(
+                f"--state {chosen}: `{self.args.command}` reads approvals and halts from, and "
+                f"writes the ledger to, the state directory the fleet file declares "
+                f"({declared}); point --state elsewhere only for read-only commands "
+                f"({', '.join(sorted(_STATE_READERS))})")
+        return StateDir(chosen)
 
     def patch(self) -> Patch:
         return load_patch(self.args.patch)

@@ -51,6 +51,9 @@ def project(tmp_path):
     (tmp_path / "scripts" / "restart-all.sh").write_text(
         "#!/bin/sh\nfor c in agent-01 agent-02; do\n  docker restart agent-01\ndone\n")
     (tmp_path / "scripts" / "report.sh").write_text("#!/bin/sh\ndocker ps\ndf -h\n")
+    # Two scripts with the same name: which one runs depends on the working directory.
+    (tmp_path / "status.sh").write_text("#!/bin/sh\ndocker ps\n")
+    (tmp_path / "scripts" / "status.sh").write_text("#!/bin/sh\ndocker restart agent-01\n")
     return tmp_path
 
 
@@ -183,6 +186,95 @@ def test_denied_commands(project, command, reason):
     message = denied(bash(project, command))
     assert message is not None, f"expected a denial for: {command}"
     assert reason in message
+
+
+# -- the fleet CLI is pinned to the fleet file the guard protects ----------------------
+
+# A rollout pointed at another state directory skips its approvals, halts and ledger; one
+# pointed at another fleet file can name targets, tickets and a state directory of its own.
+PINNED_DENY = [
+    ("fleet-rollout apply p.yaml --ticket CHG-1042 --include-customer --state /tmp/agent-state",
+     "state directory"),
+    ("fleet-rollout apply p.yaml --ticket CHG-1042 --state=/tmp/agent-state", "state directory"),
+    ("fleet-rollout rollback p.yaml --target agent-01 --ticket CHG-1042 --state /tmp/s",
+     "state directory"),
+    ("fleet-rollout apply evil.yaml --fleet /tmp/evil-fleet.yaml --targets x1 --ticket CHG-1042",
+     "fleet file"),
+    ("fleet-rollout apply p.yaml --fleet=/tmp/evil-fleet.yaml --ticket CHG-1042", "fleet file"),
+    ("fleet-rollout unlock agent-01 --ticket CHG-1042 --fleet /tmp/evil-fleet.yaml", "fleet file"),
+    ("fleet-rollout apply p.yaml --fleet fleet.yaml --fleet /tmp/e.yaml --ticket CHG-1042",
+     "fleet file"),                                      # the last one wins, as in argparse
+    ("ssh build.example.org fleet-rollout apply p.yaml --ticket CHG-1042", "fleet file"),
+    ("cd scripts && fleet-rollout apply ../p.yaml --ticket CHG-1042", "fleet file"),
+    ('cd "$WORK" && fleet-rollout apply p.yaml --fleet fleet.yaml --ticket CHG-1042',
+     "computed at run time"),
+    ("env -C scripts fleet-rollout apply p.yaml --ticket CHG-1042", "fleet file"),
+    ("sudo --chdir=scripts fleet-rollout apply p.yaml --ticket CHG-1042", "fleet file"),
+    ("fleet-rollout apply p.yaml --fle /tmp/evil-fleet.yaml --ticket CHG-1042", "--fle"),
+    ("fleet-rollout apply p.yaml --ticket CHG-1042 -x", "-x"),
+    ("fleet-rollout apply p.yaml --targets agent-09 --ticket CHG-1042", "agent-09"),
+    ("fleet-rollout rollback p.yaml --target x1 --ticket CHG-1042", "x1"),
+    ("fleet-rollout apply p.yaml --ticket $T", "computed at run time"),
+    ("python -m fleet_rollout.cli apply p.yaml --ticket CHG-1042 --state /tmp/s",
+     "state directory"),
+    ("python3 -I -m fleet_rollout apply p.yaml --fleet /tmp/e.yaml --ticket CHG-1042",
+     "fleet file"),
+    ("uv run fleet-rollout apply p.yaml --ticket CHG-1042 --state /tmp/s", "fleet-rollout"),
+    ("python -c 'from fleet_rollout.cli import main; main([])'", "fleet_rollout"),
+    ('f() { fleet-rollout "$@"; }; f apply p.yaml --ticket CHG-1042', "computed at run time"),
+    ("find /tmp -name '*.yaml' -execdir fleet-rollout apply p.yaml --ticket CHG-1042 \\;",
+     "computed at run time"),
+    ("echo --state=/tmp/s | xargs fleet-rollout apply p.yaml --ticket CHG-1042",
+     "appended at run time"),
+    # The script that runs is the one in the directory the shell has changed into.
+    ("cd scripts && bash status.sh", "agent-01"),
+    ("cd scripts; ./status.sh", "agent-01"),
+    ('cd "$DIR" && bash status.sh', "cannot read"),
+]
+
+
+@pytest.mark.parametrize("command, reason", PINNED_DENY)
+def test_the_fleet_cli_cannot_be_pointed_at_other_state(project, command, reason):
+    message = denied(bash(project, command))
+    assert message is not None, f"expected a denial for: {command}"
+    assert reason in message
+
+
+PINNED_ALLOW = [
+    "fleet-rollout apply p.yaml --ticket CHG-1042",                 # ./fleet.yaml is the guard's
+    "fleet-rollout apply p.yaml --fleet ./fleet.yaml --ticket CHG-1042",
+    "fleet-rollout apply p.yaml --fleet fleet.yaml --state .fleet-state --ticket CHG-1042",
+    "fleet-rollout apply p.yaml --targets agent-01,agent-02 --ticket CHG-1042",
+    "fleet-rollout rollback p.yaml --target agent-02 --ticket CHG-1042",
+    "fleet-rollout unlock --run-lock --ticket CHG-1042",
+    "python -m fleet_rollout apply p.yaml --ticket CHG-1042",
+    "fleet-rollout apply --help",
+    "fleet-rollout status p.yaml --state /tmp/elsewhere",            # read-only verbs
+    "fleet-rollout ledger verify --fleet /tmp/other-fleet.yaml",
+    "cd scripts && bash report.sh",
+    "bash status.sh",
+]
+
+
+@pytest.mark.parametrize("command", PINNED_ALLOW)
+def test_the_fleet_cli_on_its_own_fleet_is_allowed(project, command):
+    assert bash(project, command) is None
+
+
+def test_an_absolute_fleet_path_is_compared_by_location(project):
+    fleet = (project / "fleet.yaml").as_posix()
+    assert bash(project, f"cd /tmp; fleet-rollout apply p.yaml --fleet {fleet} "
+                         "--ticket CHG-1042") is None
+
+
+def test_the_default_fleet_file_is_the_one_in_the_commands_directory(project):
+    other = project / "elsewhere"
+    other.mkdir()
+    (other / "fleet.yaml").write_text(FLEET)           # a copy the agent could have written
+    result = hook(project, {"tool_name": "Bash", "cwd": str(other),
+                            "tool_input": {"command": "fleet-rollout apply p.yaml "
+                                                      "--ticket CHG-1042"}})
+    assert "fleet file" in denied(result)
 
 
 def test_write_and_edit_tools_cannot_touch_protected_files(project):

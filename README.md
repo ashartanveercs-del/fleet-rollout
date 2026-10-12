@@ -44,9 +44,9 @@ the body, and only the body check caught it.
 | **Ledger, locks, recovery** | An append-only, hash-chained JSONL ledger. Locks are taken on each target (atomic exclusive create on the target itself) and on the state directory. An interrupted transaction is undone from its write-ahead backup log before anything else runs. |
 | **Drift against a golden template** | One golden workspace tree, rendered per target (`{{ fleet.target.name }}`, `{{ fleet.vars.region }}`), compared byte for byte with every target. Text differences come back as unified diffs, binary ones as checksums. |
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
-| **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
+| **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 554 tests, offline, no keys. Includes real SQLite upserts, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 598 tests, offline, no keys. Includes real SQLite upserts, real shell scripts, and a loopback HTTP server. |
 
 ## Architecture
 
@@ -149,7 +149,10 @@ redirections, heredocs, `$(...)`, backticks and process substitution. It flatten
 command a script would run, and marks any word whose value is computed at run time. Each
 command is then classified in context (this machine, a non-fleet host, a fleet host,
 inside a fleet container). The classifier strips wrappers and re-parses `ssh` remote
-commands and `sh -c` scripts. It reads local shell scripts from disk before they run.
+commands and `sh -c` scripts. It reads local shell scripts from disk before they run, from
+every directory a `cd` (or `env -C`) may have moved the shell into. `fleet-rollout` itself
+is read the way its argparse parser reads it, and the CLI refuses abbreviated options
+(`--fle` for `--fleet`), so the two cannot disagree about what a command line says.
 Anything it cannot name is denied: no ticket can authorize a target nobody can identify.
 
 ## Quick start
@@ -256,7 +259,7 @@ The fleet file ([example](examples/fleet.yaml)):
 | `fleet` | required | fleet name |
 | `golden` | none | golden template directory (relative to the fleet file) |
 | `tickets_dir` | none | change tickets; without it no ticket can be valid |
-| `state_dir` | `.fleet-state` | ledger, approvals, backups, run lock |
+| `state_dir` | `.fleet-state` | ledger, approvals, backups, run lock. Commands that write state always use it; `--state` only redirects read-only ones (`plan`, `status`, `ledger`, `locks`) |
 | `defaults.executor` | none | `docker` (local `docker exec`) or `ssh` (`ssh host -- docker exec`) |
 | `defaults.root` | none | the workspace jail inside each container (never `/`) |
 | `defaults.health` | none | `port`, `path` and at least one of `expect_json` / `expect_body` / `expect_contains`; optional `expect_status` (200), `retries` (3), `interval_seconds` (2), `timeout_seconds` (5) |
@@ -289,6 +292,8 @@ Install it with the settings in [`examples/claude-settings.json`](examples/claud
 | `docker rm -f $(docker ps -aq)`, `for c in …; do docker restart $c; done`, `echo … \| bash` | denied: target computed at run time / script not inspectable |
 | `fleet-rollout apply … --ticket CHG-1042` | allowed if the ticket covers every selected target |
 | `fleet-rollout approve …`, `fleet-rollout clear-halt …` | denied: those are human decisions |
+| `fleet-rollout apply … --state /tmp/x`, `--fleet other.yaml`, `cd elsewhere && fleet-rollout apply …` | denied: a mutation must use the fleet file the guard protects and that fleet's state directory, or it could bring its own targets, tickets, approvals and halts |
+| `uv run fleet-rollout …`, `python -c` code that imports `fleet_rollout`, an abbreviated option | denied: run the CLI directly, with options spelled out |
 | writing tickets, the state dir, the fleet file or `.claude/settings*.json` (Bash or Write/Edit) | denied |
 | a payload it cannot read, a command it cannot parse, an unknown `cwd`, an internal error | denied (fail closed) |
 
@@ -301,7 +306,7 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 554 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # 598 tests, under a minute, offline; no Docker, SSH or keys
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```

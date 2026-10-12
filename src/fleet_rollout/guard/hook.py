@@ -69,7 +69,7 @@ class Guard:
             protected.append(self.fleet.state_dir)
             if self.fleet.tickets_dir is not None:
                 protected.append(self.fleet.tickets_dir)
-        return Inventory(self.fleet, protected)
+        return Inventory(self.fleet, protected, fleet_file=self.fleet_file)
 
     def decide(self, payload: Any) -> str | None:
         """The reason to deny, or None to stay out of the way."""
