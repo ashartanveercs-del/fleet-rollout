@@ -172,6 +172,7 @@ DENY = [
     ("fleet-rollout apply p.yaml --fleet fleet.yaml --ticket CHG-2001", "does not cover"),
     ("fleet-rollout approve p.yaml --target agent-03 --approver ops.oncall", "people"),
     ("fleet-rollout clear-halt greeting-v2 --reason fixed", "human"),
+    ("CHANGE_TICKET=CHG-1042 fleet-rollout rollback p.yaml --target agent-02 --force", "human"),
     ("echo 'id: CHG-9000' > tickets/CHG-9000.yaml", "protected"),
     ("python -c \"open('tickets/CHG-9000.yaml', 'w').write('x')\"", "protected"),
     ("sed -i 's/customer/internal/' fleet.yaml", "protected"),

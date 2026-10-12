@@ -372,7 +372,19 @@ class Rollout:
             return False
         try:
             entries = self.state.backups().manifest(old_run, target.name).entries()
-            restore = self._tx(target).restore(entries)
+            tx = self._tx(target)
+            try:
+                changed = tx.conflicts(entries)
+            except ExecutorError as exc:
+                changed = [f"cannot read the target ({exc})"]
+            if changed:
+                self._abort(report, f"{target.name} has an interrupted transaction of "
+                                    f"{self.patch.id} from run {old_run}, but "
+                                    f"{'; '.join(changed)}. Nothing was changed. Inspect the "
+                                    "target; `fleet-rollout rollback --force` puts the recorded "
+                                    "pre-state back over that change.")
+                return False
+            restore = tx.restore(entries)
             if restore.ok:
                 self._log("recovered", target.name,
                           f"undid interrupted run {old_run}: {restore.detail}")
@@ -408,9 +420,14 @@ class Rollout:
 def rollback_target(fleet: Fleet, patch: Patch, target_name: str, *,
                     executor_for: ExecutorFactory, state: StateDir, operator: str,
                     ticket: Ticket, clock: Clock, sleep: Callable[[float], None] = time.sleep,
-                    include_customer: bool = False, run_id: str | None = None) -> RestoreReport:
+                    include_customer: bool = False, run_id: str | None = None,
+                    force: bool = False) -> RestoreReport:
     """Put one target back to the pre-state recorded by the latest run of `patch` on it.
-    A rollback is a mutation: same ticket, consent and lock rules as a rollout."""
+    A rollback is a mutation: same ticket, consent and lock rules as a rollout.
+
+    It undoes this patch only. If a file or row it wrote has changed since (a later
+    patch, a hand edit, the agent itself), the rollback is refused before anything is
+    touched; `force` restores the recorded pre-state over that change."""
     target = fleet.target(target_name)
     now = clock()
     problem = ticket_problem(ticket, [target], now) or consent_problem(
@@ -442,13 +459,20 @@ def rollback_target(fleet: Fleet, patch: Patch, target_name: str, *,
         try:
             tx = TargetTransaction(target, executor, patch, state.backups(), run_id=run_id,
                                    operator=operator, clock=clock, sleep=sleep)
-            restore = tx.restore(entries)
+            changed = [] if force else tx.conflicts(entries)
+            if changed:
+                raise RolloutError(
+                    f"refusing to roll back {patch.id} on {target.name}: {'; '.join(changed)}. "
+                    "Nothing was changed. Roll back the later change first, or pass --force "
+                    "to put the recorded pre-state back over it")
+            restore = tx.restore(entries, force=force)
         finally:
             release(executor, target.root, run_id)
+        how = "forced: " if force else ""
         ledger.append(run=run_id, event="manual_rollback" if restore.ok else "rollback_failed",
                       operator=operator, ts=clock(), patch=patch.id, digest=patch.digest,
                       target=target.name, halt=not restore.ok, ticket=ticket.id,
-                      detail=f"restored the pre-state recorded by run {source}: "
+                      detail=f"{how}restored the pre-state recorded by run {source}: "
                              f"{restore.detail}")
         return restore
     finally:

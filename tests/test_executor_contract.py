@@ -185,15 +185,27 @@ def test_sql_upsert(env, tmp_path):
     env.ex.write(db, seed.read_bytes())
     payload = {"db": db, "table": "settings", "key_column": "name", "key": "greeting",
                "values": {"value": "Hi"}}
-    result = env.ex.run(["python3", "-c", scripts.SQL_UPSERT],
-                        stdin=json.dumps(payload).encode())
+
+    def row_op(op, **extra):
+        return env.ex.run(["python3", "-c", scripts.SQL_ROW],
+                          stdin=json.dumps({"op": op, **payload, **extra}).encode())
+
+    def value():
+        after = tmp_path / "after.db"
+        after.write_bytes(env.ex.read(db))
+        con = sqlite3.connect(after)
+        try:
+            return con.execute("SELECT value FROM settings WHERE name='greeting'").fetchone()
+        finally:
+            con.close()
+
+    assert json.loads(row_op("read").stdout) == {"ok": True, "row": None}
+    result = row_op("upsert", previous=None)
     assert result.ok, result.summary()
     assert json.loads(result.stdout) == {"ok": True, "row": {"value": "Hi"}}
-    after = tmp_path / "after.db"
-    after.write_bytes(env.ex.read(db))
-    con = sqlite3.connect(after)
-    assert con.execute("SELECT value FROM settings WHERE name='greeting'").fetchone() == ("Hi",)
-    con.close()
+    assert value() == ("Hi",)
+    assert row_op("restore", previous=None).ok
+    assert value() is None
 
 
 def test_unknown_commands_fail(env):

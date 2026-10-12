@@ -39,14 +39,14 @@ the body, and only the body check caught it.
 | | |
 |---|---|
 | **Hostile-input patch specs** | Strict YAML (duplicate keys, anchors/aliases and merge keys are rejected). Every path, SQL identifier and command passes an allowlist before a plan exists. A spec can *name* an allowlisted command but cannot *express* one. |
-| **Per-target transactions** | Checksummed backup, then stage the new file next to the target, read the staged copy back, run the syntax gate, atomic rename, read back the live file. Then a health gate on the response body, `verify` assertions, and an applied marker written last. Any failure restores the target and proves each restored file by sha256. |
+| **Per-target transactions** | Checksummed backup, then stage the new file next to the target, read the staged copy back, run the syntax gate, atomic rename, read back the live file. Then a health gate on the response body, `verify` assertions, and an applied marker written last. Any failure restores the target and proves each restored file by sha256; a database row goes back column by column. |
 | **Canary, then cohorts, then the rest** | The canary goes first, then one target from each remaining cohort, then everything else, internal targets before customer-owned ones. Rollouts are serial and stop at the first red. An optional bake period re-checks every patched target between waves. |
 | **Ledger, locks, recovery** | An append-only, hash-chained JSONL ledger. Locks are taken on each target (atomic exclusive create on the target itself) and on the state directory. An interrupted transaction is undone from its write-ahead backup log before anything else runs. |
 | **Drift against a golden template** | One golden workspace tree, rendered per target (`{{ fleet.target.name }}`, `{{ fleet.vars.region }}`), compared byte for byte with every target. Text differences come back as unified diffs, binary ones as checksums. |
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
 | **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 598 tests, offline, no keys. Includes real SQLite upserts, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 621 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
 
 ## Architecture
 
@@ -116,14 +116,22 @@ whatever sits at the staging path (`rm` unlinks a planted symlink rather than fo
 it), then creates the file exclusively (`set -C`), so nothing can be slipped in between.
 
 **3. The backup log is a write-ahead undo log.** Before a step mutates a file, its
-current bytes go into a content-addressed store, and `{step, path, sha_before}` is
-appended and fsynced to the run's manifest. So whatever state a crash leaves a target
-in, the next run finds the `started` record with no terminal record, takes the lock,
-restores every logged file, and records `recovered` before doing anything else. Restores
-are verified in both directions. The backup object must hash to its own name, and the
-staged restore must read back intact *before* it is renamed over the live file. That
-second check was missing at first, and a fault-injection test showed a lossy transfer
-during restore could land damaged bytes on the live file.
+current bytes go into a content-addressed store, and `{step, path, sha_before,
+sha_after}` is appended and fsynced to the run's manifest. So whatever state a crash
+leaves a target in, the next run finds the `started` record with no terminal record,
+takes the lock, restores every logged file, and records `recovered` before doing
+anything else. Restores are verified in both directions. The backup object must hash
+to its own name, and the staged restore must read back intact *before* it is renamed
+over the live file. That second check was missing at first, and a fault-injection
+test showed a lossy transfer during restore could land damaged bytes on the live file.
+
+A restore undoes *this* patch and nothing else. `sha_after` records what the step
+installs, so a file that has changed since (a later patch to the same file, a hand
+edit) is reported and left alone; `fleet-rollout rollback` refuses before touching
+anything, and only `--force` (a person's decision) overwrites the later change. A
+`sql_upsert` logs the row's previous values, and a restore puts those columns back (or
+deletes a row the patch inserted). An earlier version swapped the whole database
+file back, which silently deleted every row the agent had written since the patch.
 
 **4. Health means the body.** A reverse proxy's catch-all route, a maintenance page, and
 an agent that failed to load its config all answer 200. The fleet file refuses a health
@@ -195,7 +203,7 @@ fleet-rollout ledger verify --fleet fleet.yaml
 | `validate PATCH` | Load and validate a spec, print its steps and digest | no |
 | `plan PATCH` | Waves, held-back and blocked targets, golden-template warnings | no |
 | `apply PATCH --ticket ID` | The rollout. Needs `--include-customer` for customer targets | yes |
-| `rollback PATCH --target T --ticket ID` | Restore one target to the pre-state its last run recorded | yes |
+| `rollback PATCH --target T --ticket ID` | Restore one target to the pre-state its last run recorded; refused if a file or row changed since (`--force` overrides) | yes |
 | `status PATCH` | Per-target state from the ledger, and any halt | no |
 | `drift` | Diff every target against the rendered golden template | read-only |
 | `approve PATCH --target T --approver P --note N` | Record one approval (bound to the patch digest) | no |
@@ -291,7 +299,7 @@ Install it with the settings in [`examples/claude-settings.json`](examples/claud
 | `CHANGE_TICKET=CHG-1042 docker restart agent-01` | allowed if the ticket is valid, unexpired and covers agent-01 |
 | `docker rm -f $(docker ps -aq)`, `for c in …; do docker restart $c; done`, `echo … \| bash` | denied: target computed at run time / script not inspectable |
 | `fleet-rollout apply … --ticket CHG-1042` | allowed if the ticket covers every selected target |
-| `fleet-rollout approve …`, `fleet-rollout clear-halt …` | denied: those are human decisions |
+| `fleet-rollout approve …`, `fleet-rollout clear-halt …`, `fleet-rollout rollback … --force` | denied: those are human decisions |
 | `fleet-rollout apply … --state /tmp/x`, `--fleet other.yaml`, `cd elsewhere && fleet-rollout apply …` | denied: a mutation must use the fleet file the guard protects and that fleet's state directory, or it could bring its own targets, tickets, approvals and halts |
 | `uv run fleet-rollout …`, `python -c` code that imports `fleet_rollout`, an abbreviated option | denied: run the CLI directly, with options spelled out |
 | writing tickets, the state dir, the fleet file or `.claude/settings*.json` (Bash or Write/Edit) | denied |
@@ -306,7 +314,7 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 598 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # 621 tests, under a minute, offline; no Docker, SSH or keys
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```
@@ -320,9 +328,10 @@ all of them on Linux.
   quietly drift from reality.
 - [`tests/test_transaction.py`](tests/test_transaction.py) injects faults at every
   stage (syntax errors, a lossy transport, a read-only filesystem mid-step, Ctrl-C,
-  a tampered backup, a restore that cannot write). Every case asserts the target ends
-  byte-identical to its pre-state, or is reported as a partial restore naming the
-  remaining files.
+  a tampered backup, a restore that cannot write, a later change a restore must not
+  overwrite). Every case asserts the target ends in its pre-state (files byte-identical,
+  rows holding their previous values), or is reported as a partial restore naming what
+  is still wrong.
 - [`tests/test_rollout.py`](tests/test_rollout.py) drives five fake agents through
   waves, halts, resume, crash recovery from a half-applied target, bake checks and
   ledger write failures.
@@ -330,8 +339,8 @@ all of them on Linux.
   commands with the expected decision, and runs the installed hook entry point as a
   subprocess.
 - [`tests/test_scripts.py`](tests/test_scripts.py) runs the on-target programs for real:
-  SQLite upserts against a temp database (including injection attempts) and the HTTP
-  probe against a loopback server.
+  SQLite row reads, upserts and restores against a temp database (including injection
+  attempts) and the HTTP probe against a loopback server.
 
 ## Security notes
 
@@ -354,8 +363,9 @@ all of them on Linux.
   scripts.
 - **Not undone by a restore:** directories created by `make_dirs` and permission changes
   made by `make_executable`. `reload_agent` is re-run after a restore so the agent picks
-  up the restored files. `sql_upsert` refuses a database with a non-empty write-ahead log,
-  because a byte-level backup of it would not be a consistent snapshot.
+  up the restored files. A `sql_upsert` is undone row by row, so rows the agent wrote
+  since are kept. It refuses a database with a non-empty write-ahead log, because the
+  byte-level copy it also keeps would not be a consistent snapshot.
 
 ## Roadmap
 

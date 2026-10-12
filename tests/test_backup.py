@@ -2,7 +2,7 @@ import hashlib
 
 import pytest
 
-from fleet_rollout.backup import BackupCorrupt, BackupEntry, BackupStore
+from fleet_rollout.backup import BackupCorrupt, BackupEntry, BackupStore, RowChange
 from fleet_rollout.validation import ValidationError
 
 
@@ -45,6 +45,22 @@ def test_manifest_records_entries_in_order_including_absent_files(tmp_path):
     assert reopened.entries() == [
         BackupEntry(0, "/srv/agent/config/a.txt", "a" * 64),
         BackupEntry(1, "/srv/agent/config/new.txt", None)]
+
+
+def test_manifest_entries_keep_what_the_step_wrote(tmp_path):
+    store = BackupStore(tmp_path / "backups")
+    manifest = store.manifest("r-1", "agent-01")
+    entries = [
+        BackupEntry(0, "/srv/agent/config/a.txt", "a" * 64, "b" * 64),
+        BackupEntry(1, "/srv/agent/data/settings.db", "c" * 64, None,
+                    RowChange("settings", "name", "invoice_template", (("value", "v2"),),
+                              (("value", "v1"),))),
+        BackupEntry(2, "/srv/agent/data/settings.db", "c" * 64, None,
+                    RowChange("settings", "id", 7, (("rate", 1.5), ("label", "x")), None)),
+    ]
+    for entry in entries:
+        manifest.record(entry)
+    assert store.manifest("r-1", "agent-01").entries() == entries
 
 
 def test_a_torn_final_line_from_a_crash_is_ignored(tmp_path):

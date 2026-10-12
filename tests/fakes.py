@@ -54,6 +54,20 @@ def settings_db() -> bytes:
         return path.read_bytes()
 
 
+def agent_writes_db(fx: FakeExecutor, sql: str, *params) -> None:
+    """The live agent writing to its own settings database, outside any rollout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "live.db"
+        path.write_bytes(fx.files[f"{ROOT}/data/settings.db"])
+        con = sqlite3.connect(path)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+        fx.files[f"{ROOT}/data/settings.db"] = path.read_bytes()
+
+
 def db_value(fx: FakeExecutor, key: str = "invoice_template") -> str | None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "copy.db"

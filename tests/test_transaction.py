@@ -5,8 +5,19 @@ import hashlib
 import json
 
 import pytest
-from fakes import AGENT_JSON, ROOT, WORKSPACE, Clock, agent, db_value, make_patch, make_target
+from fakes import (
+    AGENT_JSON,
+    ROOT,
+    WORKSPACE,
+    Clock,
+    agent,
+    agent_writes_db,
+    db_value,
+    make_patch,
+    make_target,
+)
 
+from fleet_rollout import scripts
 from fleet_rollout.backup import BackupStore
 from fleet_rollout.executors.base import ExecutorError
 from fleet_rollout.locks import LockOwner, acquire
@@ -251,6 +262,58 @@ def test_a_lossy_transport_during_restore_never_corrupts_the_live_file(tmp_path)
     assert live(fx, "config/greeting.txt") == GREETING_V2   # patched but intact, never damaged
 
 
+def test_the_manifest_records_what_each_step_leaves_behind(tmp_path):
+    fx = agent()
+    t = tx(tmp_path, fx, greeting_patch(tmp_path))
+    assert t.apply().ok
+    [entry] = t.store.manifest("r-1", "agent-01").entries()
+    assert entry.sha_before == sha(WORKSPACE["config/greeting.txt"])
+    assert entry.sha_after == sha(GREETING_V2)
+
+
+def test_a_restore_never_overwrites_a_file_changed_after_the_patch(tmp_path):
+    # Regression: a rollback days later replayed the pre-state over whatever was there,
+    # silently undoing every later patch to the same file.
+    fx = agent()
+    t = tx(tmp_path, fx, greeting_patch(tmp_path))
+    assert t.apply().ok
+    fx.put(f"{ROOT}/config/greeting.txt", b"written by a later patch\n")
+    entries = t.store.manifest("r-1", "agent-01").entries()
+    [conflict] = t.conflicts(entries)
+    assert "config/greeting.txt" in conflict and "changed since" in conflict
+    report = t.restore(entries)
+    assert not report.ok and any("changed since" in f for f in report.failed)
+    assert live(fx, "config/greeting.txt") == b"written by a later patch\n"
+    forced = t.restore(entries, force=True)
+    assert forced.ok, forced.detail
+    assert live(fx, "config/greeting.txt") == WORKSPACE["config/greeting.txt"]
+
+
+def test_a_file_already_back_in_its_pre_state_is_left_alone(tmp_path):
+    fx = agent()
+    t = tx(tmp_path, fx, greeting_patch(tmp_path))
+    assert t.apply().ok
+    fx.put(f"{ROOT}/config/greeting.txt", WORKSPACE["config/greeting.txt"])
+    entries = t.store.manifest("r-1", "agent-01").entries()
+    assert t.conflicts(entries) == []
+    renames = len([c for c in fx.calls if c[0] == "rename"])
+    assert t.restore(entries).ok
+    assert len([c for c in fx.calls if c[0] == "rename"]) == renames
+
+
+def test_a_file_the_patch_created_is_removed_only_if_it_is_unchanged(tmp_path):
+    fx = agent()
+    patch = make_patch(tmp_path, [write_step("files/faq.md", "prompts/faq.md")],
+                       files={"files/faq.md": b"# FAQ\n"})
+    t = tx(tmp_path, fx, patch)
+    assert t.apply().ok
+    fx.put(f"{ROOT}/prompts/faq.md", b"# FAQ\n- edited later\n")
+    entries = t.store.manifest("r-1", "agent-01").entries()
+    assert not t.restore(entries).ok and live(fx, "prompts/faq.md") is not None
+    fx.put(f"{ROOT}/prompts/faq.md", b"# FAQ\n")
+    assert t.restore(entries).ok and live(fx, "prompts/faq.md") is None
+
+
 def test_restore_clears_the_marker_first(tmp_path):
     fx = agent()
     t = tx(tmp_path, fx, greeting_patch(tmp_path))
@@ -395,13 +458,64 @@ def test_sql_upsert_updates_the_row_and_reads_it_back(tmp_path):
     assert db_value(fx) == "v2"
 
 
-def test_a_later_failure_restores_the_database_bytes(tmp_path):
+def test_a_later_failure_puts_the_row_back(tmp_path):
     fx = agent(with_db=True)
-    before = fx.files[f"{ROOT}/data/settings.db"]
     outcome = tx(tmp_path, fx, sql_patch(tmp_path, then_fail=True)).apply()
     assert not outcome.ok and outcome.restore.ok
-    assert fx.files[f"{ROOT}/data/settings.db"] == before
     assert db_value(fx) == "v1"
+
+
+def test_sql_upsert_is_undone_row_by_row(tmp_path):
+    # Regression: the database used to be restored by swapping the whole file back, which
+    # deleted every row the live agent had written since the patch.
+    fx = agent(with_db=True)
+    t = tx(tmp_path, fx, sql_patch(tmp_path))
+    assert t.apply().ok
+    agent_writes_db(fx, "INSERT INTO settings VALUES ('customer_note', 'written by the agent')")
+    report = t.restore(t.store.manifest("r-1", "agent-01").entries())
+    assert report.ok, report.detail
+    assert db_value(fx) == "v1"
+    assert db_value(fx, "customer_note") == "written by the agent"
+
+
+def test_a_row_changed_after_the_patch_is_not_overwritten(tmp_path):
+    fx = agent(with_db=True)
+    t = tx(tmp_path, fx, sql_patch(tmp_path))
+    assert t.apply().ok
+    agent_writes_db(fx, "UPDATE settings SET value = 'v3' WHERE name = 'invoice_template'")
+    entries = t.store.manifest("r-1", "agent-01").entries()
+    [conflict] = t.conflicts(entries)
+    assert "invoice_template" in conflict and "changed since" in conflict
+    assert not t.restore(entries).ok and db_value(fx) == "v3"
+    assert t.restore(entries, force=True).ok and db_value(fx) == "v1"
+
+
+def test_a_row_the_patch_inserted_is_deleted_on_restore(tmp_path):
+    fx = agent(with_db=True)
+    patch = make_patch(tmp_path, [{"kind": "sql_upsert", "db": "data/settings.db",
+                                   "table": "settings", "key_column": "name",
+                                   "key": "receipt_footer", "values": {"value": "Thanks!"}}])
+    t = tx(tmp_path, fx, patch)
+    assert t.apply().ok and db_value(fx, "receipt_footer") == "Thanks!"
+    assert t.restore(t.store.manifest("r-1", "agent-01").entries()).ok
+    assert db_value(fx, "receipt_footer") is None and db_value(fx) == "v1"
+
+
+def test_an_upsert_refuses_a_row_that_changed_after_it_was_backed_up(tmp_path):
+    fx = agent(with_db=True)
+    real_run = fx.run
+
+    def racing_agent(argv, *, stdin=None, timeout=60.0):
+        if argv[:3] == ["python3", "-c", scripts.SQL_ROW] and json.loads(stdin)["op"] == "upsert":
+            agent_writes_db(fx, "UPDATE settings SET value = 'agent' "
+                                "WHERE name = 'invoice_template'")
+        return real_run(argv, stdin=stdin, timeout=timeout)
+
+    fx.run = racing_agent
+    outcome = tx(tmp_path, fx, sql_patch(tmp_path)).apply()
+    assert not outcome.ok and "changed" in outcome.error
+    assert db_value(fx) == "agent"                  # the agent's write survives
+    assert outcome.restore.ok                       # and nothing of ours needed undoing
 
 
 def test_sql_upsert_refuses_a_database_with_a_live_write_ahead_log(tmp_path):

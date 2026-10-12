@@ -1,10 +1,17 @@
 """Operator-side backups: a content-addressed object store plus a write-ahead manifest.
 
 Before a step mutates a file on a target, the engine reads the file, stores its bytes
-under `objects/<sha256>`, and appends `{step, path, sha_before}` to the manifest for
-(run, target), with an fsync, *before* the mutation happens. That ordering turns the
-manifest into an undo log: whatever state a crash leaves a target in, every file the
-run touched has a recorded, checksummed pre-state to go back to.
+under `objects/<sha256>`, and appends `{step, path, sha_before, sha_after}` to the
+manifest for (run, target), with an fsync, *before* the mutation happens. `sha_after` is
+what the step is about to install. That ordering turns the manifest into an undo log:
+whatever state a crash leaves a target in, every file the run touched has a recorded,
+checksummed pre-state to go back to, and a restore can tell this patch's bytes from a
+later change it must not overwrite.
+
+A `sql_upsert` step changes one row of a live database, so its entry also records the
+row: the columns the step writes and their values before it (`row`). It is undone by
+putting those values back, never by swapping the database file, which would delete
+whatever the agent wrote since.
 
 Objects are verified on the way in and on the way out. A backup that no longer hashes
 to its own name is refused rather than "restored".
@@ -16,10 +23,14 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .validation import ValidationError, target_name
+
+Scalar = str | int | float | None
+Columns = tuple[tuple[str, Scalar], ...]
 
 _RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
@@ -43,10 +54,36 @@ def _fsync_write(path: Path, data: bytes, *, append: bool) -> None:
 
 
 @dataclass(frozen=True)
+class RowChange:
+    """The one row a `sql_upsert` step changes, restored by value."""
+    table: str
+    key_column: str
+    key: str | int
+    written: Columns                # the columns the step sets, and the values it sets
+    previous: Columns | None        # those columns before the step; None: no such row
+
+    def to_doc(self) -> dict[str, Any]:
+        return {"table": self.table, "key_column": self.key_column, "key": self.key,
+                "written": [list(c) for c in self.written],
+                "previous": None if self.previous is None else [list(c) for c in self.previous]}
+
+    @classmethod
+    def from_doc(cls, doc: Any) -> RowChange:
+        def columns(raw: Any) -> Columns:
+            return tuple((str(name), value) for name, value in raw)
+
+        return cls(table=str(doc["table"]), key_column=str(doc["key_column"]), key=doc["key"],
+                   written=columns(doc["written"]),
+                   previous=None if doc["previous"] is None else columns(doc["previous"]))
+
+
+@dataclass(frozen=True)
 class BackupEntry:
     step: int
     path: str                 # absolute path on the target
     sha_before: str | None    # None: the file did not exist before the step
+    sha_after: str | None = None    # the bytes the step installs (None for a row entry)
+    row: RowChange | None = None    # set for sql_upsert: restored row by row
 
 
 class Manifest:
@@ -56,7 +93,10 @@ class Manifest:
         self.path = path
 
     def record(self, entry: BackupEntry) -> None:
-        line = json.dumps(asdict(entry), sort_keys=True, separators=(",", ":")) + "\n"
+        doc = {"step": entry.step, "path": entry.path, "sha_before": entry.sha_before,
+               "sha_after": entry.sha_after,
+               "row": entry.row.to_doc() if entry.row is not None else None}
+        line = json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n"
         _fsync_write(self.path, line.encode("utf-8"), append=True)
 
     def exists(self) -> bool:
@@ -74,8 +114,11 @@ class Manifest:
                 continue
             try:
                 doc = json.loads(line)
+                row = doc.get("row")
                 out.append(BackupEntry(step=int(doc["step"]), path=str(doc["path"]),
-                                       sha_before=doc["sha_before"]))
+                                       sha_before=doc["sha_before"],
+                                       sha_after=doc.get("sha_after"),
+                                       row=RowChange.from_doc(row) if row is not None else None))
             except (ValueError, KeyError, TypeError) as exc:
                 if torn_tail and number == len(lines):
                     break  # a crash mid-append; the mutation it guarded never started

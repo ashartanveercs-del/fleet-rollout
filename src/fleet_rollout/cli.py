@@ -131,6 +131,9 @@ def _parser() -> _Parser:
     p.add_argument("--ticket", required=True)
     p.add_argument("--operator")
     p.add_argument("--include-customer", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="also restore files and rows that changed after this patch wrote "
+                        "them, overwriting those later changes")
 
     p = sub.add_parser("status", help="per-target state of a patch, from the ledger")
     p.add_argument("patch", type=Path)
@@ -330,7 +333,8 @@ def _rollback(ctx: _Ctx) -> int:
                               state=state, operator=ctx.operator(),
                               ticket=load_ticket(fleet.tickets_dir, ctx.args.ticket),
                               clock=ctx.clock, sleep=ctx.sleep,
-                              include_customer=ctx.args.include_customer)
+                              include_customer=ctx.args.include_customer,
+                              force=ctx.args.force)
     ctx.say(f"rollback of {patch.id} on {ctx.args.target}: {restore.detail}")
     return EXIT_OK if restore.ok else EXIT_FAILED
 

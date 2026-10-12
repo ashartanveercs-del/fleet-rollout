@@ -7,8 +7,9 @@ against this fake and against the real adapter under a real shell, so the fake s
 honest. It also supports fault injection, which is how the test suite proves that every
 failure path restores the target.
 
-SQL upserts run the real `scripts.SQL_UPSERT` program with this Python interpreter
-against a temporary copy of the database bytes, so SQLite semantics are real too.
+Row reads, upserts and restores run the real `scripts.SQL_ROW` program with this Python
+interpreter against a temporary copy of the database bytes, so SQLite semantics are real
+too.
 """
 
 from __future__ import annotations
@@ -266,8 +267,8 @@ class FakeExecutor:
         self._check_faults("run", " ".join(argv))
         if argv[:3] == ["python3", "-c", scripts.COMPILE_PYTHON]:
             return self._compile(argv[3:])
-        if argv[:3] == ["python3", "-c", scripts.SQL_UPSERT]:
-            return self._sql_upsert(stdin or b"")
+        if argv[:3] == ["python3", "-c", scripts.SQL_ROW]:
+            return self._sql_row(stdin or b"")
         if argv[:3] == ["mkdir", "-p", "--"]:
             for path in argv[3:]:
                 self.mkdir(path)
@@ -311,7 +312,7 @@ class FakeExecutor:
                 return CommandResult(1, stderr=f"SyntaxError: {exc}".encode())
         return CommandResult(0)
 
-    def _sql_upsert(self, stdin: bytes) -> CommandResult:
+    def _sql_row(self, stdin: bytes) -> CommandResult:
         payload = json.loads(stdin)
         real = self._resolve(payload["db"])
         if real not in self.files:
@@ -320,9 +321,9 @@ class FakeExecutor:
             db = Path(tmp) / "db.sqlite"
             db.write_bytes(self.files[real])
             payload["db"] = str(db)
-            proc = subprocess.run([sys.executable, "-c", scripts.SQL_UPSERT],
+            proc = subprocess.run([sys.executable, "-c", scripts.SQL_ROW],
                                   input=json.dumps(payload).encode(), capture_output=True,
                                   timeout=60, check=False)
-            if proc.returncode == 0:
+            if proc.returncode == 0 and payload.get("op") != "read":
                 self.files[real] = db.read_bytes()
         return CommandResult(proc.returncode, proc.stdout, proc.stderr)

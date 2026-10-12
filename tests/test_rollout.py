@@ -1,5 +1,6 @@
 """Waves, gates and the rollout driver, end to end against five fake agents."""
 
+import hashlib
 from datetime import timedelta
 
 import pytest
@@ -9,6 +10,8 @@ from fakes import (
     WORKSPACE,
     Clock,
     agent,
+    agent_writes_db,
+    db_value,
     five_targets,
     make_fleet,
     make_patch,
@@ -38,6 +41,10 @@ ORIGINAL = WORKSPACE["config/greeting.txt"]
 
 def names(waves):
     return [[t.name for t in w.targets] for w in waves]
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
 
 
 # -- wave planning -------------------------------------------------------------------
@@ -332,18 +339,20 @@ def test_an_applied_marker_without_a_ledger_record_is_skipped_not_reapplied(tmp_
 # -- crash recovery ----------------------------------------------------------------------
 
 
-def crashed_state(env):
-    """What a SIGKILL halfway through agent-01's transaction leaves behind."""
+def crashed_state(env, patch=None):
+    """What a SIGKILL halfway through agent-01's transaction leaves behind: the new file
+    swapped in, no health check, no marker, no terminal ledger record, the lock held."""
+    patch = patch or env.patch
     fx = env.agents["agent-01"]
     store = env.state.backups()
     store.manifest("r-crashed", "agent-01").record(
-        BackupEntry(0, f"{ROOT}/config/greeting.txt", store.put(ORIGINAL)))
-    fx.put(f"{ROOT}/config/greeting.txt", b"half-applied junk\n")
+        BackupEntry(0, f"{ROOT}/config/greeting.txt", store.put(ORIGINAL), sha(GREETING_V2)))
+    fx.put(f"{ROOT}/config/greeting.txt", GREETING_V2)
     ledger = env.state.ledger()
     for event, target in (("run_started", None), ("started", "agent-01")):
         ledger.append(run="r-crashed", event=event, operator="ops.oncall", ts=T0,
-                      patch=env.patch.id, digest=env.patch.digest, target=target)
-    acquire(fx, ROOT, LockOwner("r-crashed", "ops.oncall", env.patch.id, T0.isoformat()))
+                      patch=patch.id, digest=patch.digest, target=target)
+    acquire(fx, ROOT, LockOwner("r-crashed", "ops.oncall", patch.id, T0.isoformat()))
 
 
 def test_an_interrupted_transaction_is_undone_from_its_log_before_anything_else(tmp_path):
@@ -351,7 +360,7 @@ def test_an_interrupted_transaction_is_undone_from_its_log_before_anything_else(
     crashed_state(env)
     report = env.run()
     assert not report.ok and "r-crashed" in report.aborted       # its lock is still there
-    assert env.greeting("agent-01") == b"half-applied junk\n"
+    assert env.greeting("agent-01") == GREETING_V2
     env.clock.advance(hours=3)
     owner = break_lock(env.fleet, "agent-01", executor_for=env.executor_for, state=env.state,
                        operator="ops.oncall", ticket=env.ticket(), now=env.clock())
@@ -363,6 +372,22 @@ def test_an_interrupted_transaction_is_undone_from_its_log_before_anything_else(
     assert env.greeting("agent-01") == GREETING_V2
     recovered = [r for r in env.ledger_records() if r.event == "recovered"][0]
     assert "r-crashed" in recovered.detail
+
+
+def test_recovery_does_not_overwrite_a_target_fixed_by_hand_after_the_crash(tmp_path):
+    env = Env(tmp_path)
+    crashed_state(env)
+    env.clock.advance(hours=3)
+    break_lock(env.fleet, "agent-01", executor_for=env.executor_for, state=env.state,
+               operator="ops.oncall", ticket=env.ticket(), now=env.clock())
+    env.agents["agent-01"].put(f"{ROOT}/config/greeting.txt", b"fixed by hand after the crash\n")
+    calls = {n: len(fx.calls) for n, fx in env.agents.items()}
+    report = env.run(run_id="r-after")
+    assert not report.ok and "changed since" in report.aborted
+    assert env.greeting("agent-01") == b"fixed by hand after the crash\n"
+    for name, fx in env.agents.items():          # at most the lock came and went
+        assert not [c for c in fx.calls[calls[name]:] if c[0] in ("write", "rename", "run")]
+        assert lock_path(ROOT) not in fx.files
 
 
 # -- bake checks and ledger failures ----------------------------------------------------
@@ -442,6 +467,50 @@ def test_a_manual_rollback_needs_a_covering_ticket_and_consent(tmp_path):
         rollback_target(env.fleet, env.patch, "agent-03", executor_for=env.executor_for,
                         state=env.state, operator="ops.oncall", ticket=env.ticket(),
                         clock=env.clock, sleep=lambda s: None)
+
+
+def test_a_manual_rollback_refuses_to_overwrite_a_later_patch(tmp_path):
+    # Regression: rolling back greeting-v2 replayed its pre-state over greeting-v3, which had
+    # rewritten the same file since; greeting-v3's ledger and marker still said "verified".
+    env = Env(tmp_path)
+    assert env.run().ok
+    later = make_patch(tmp_path / "v3", [{"kind": "write_file", "source": "files/greeting.txt",
+                                          "dest": "config/greeting.txt"}],
+                       files={"files/greeting.txt": b"Hi! This is the v3 greeting.\n"},
+                       pid="greeting-v3")
+    later_plan = build_plan(env.fleet, later, approvals=env.state.approvals(), now=env.clock())
+    assert env.run(plan=later_plan).ok
+    calls = len(env.agents["agent-02"].calls)
+    with pytest.raises(RolloutError, match="changed since"):
+        rollback_target(env.fleet, env.patch, "agent-02", executor_for=env.executor_for,
+                        state=env.state, operator="ops.oncall", ticket=env.ticket(),
+                        clock=env.clock, sleep=lambda s: None)
+    assert env.greeting("agent-02") == b"Hi! This is the v3 greeting.\n"
+    later_calls = env.agents["agent-02"].calls[calls:]
+    assert not [c for c in later_calls if c[0] in ("write", "rename")]   # refused up front
+    assert lock_path(ROOT) not in env.agents["agent-02"].files
+    assert env.state.ledger().target_states(env.patch.id)["agent-02"].event == "verified"
+    forced = rollback_target(env.fleet, env.patch, "agent-02", executor_for=env.executor_for,
+                             state=env.state, operator="ops.oncall", ticket=env.ticket(),
+                             clock=env.clock, sleep=lambda s: None, force=True)
+    assert forced.ok and env.greeting("agent-02") == ORIGINAL
+    [record] = [r for r in env.ledger_records() if r.event == "manual_rollback"]
+    assert "forced" in record.detail
+
+
+def test_a_manual_rollback_keeps_rows_the_agent_wrote_since(tmp_path):
+    env = Env(tmp_path, steps=[{"kind": "sql_upsert", "db": "data/settings.db",
+                                "table": "settings", "key_column": "name",
+                                "key": "invoice_template", "values": {"value": "v2"}}])
+    env.agents = {name: agent(name, with_db=True) for name in env.agents}
+    assert env.run().ok
+    fx = env.agents["agent-02"]
+    agent_writes_db(fx, "INSERT INTO settings VALUES ('customer_note', 'from the agent')")
+    result = rollback_target(env.fleet, env.patch, "agent-02", executor_for=env.executor_for,
+                             state=env.state, operator="ops.oncall", ticket=env.ticket(),
+                             clock=env.clock, sleep=lambda s: None)
+    assert result.ok, result.detail
+    assert db_value(fx) == "v1" and db_value(fx, "customer_note") == "from the agent"
 
 
 def test_rolling_back_a_target_the_patch_never_touched_is_refused(tmp_path):

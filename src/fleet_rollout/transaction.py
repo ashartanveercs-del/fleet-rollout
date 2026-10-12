@@ -12,6 +12,11 @@ Any failure, at any point, restores every file this transaction backed up, newes
 first, proving each restore by checksum, re-runs the agent reload if the patch has
 one, and re-checks health. A restore that cannot be proven is reported as a partial
 failure with the exact files that are still wrong; it is never reported as success.
+
+A restore only ever undoes this patch. A file goes back to its pre-state only while it
+still holds the bytes this patch wrote; one that has changed since (a later patch, a
+hand edit) is reported, not overwritten, unless the caller forces it. A database row
+the patch upserted is put back column by column, so rows the agent wrote since survive.
 """
 
 from __future__ import annotations
@@ -21,11 +26,12 @@ import json
 import posixpath
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from typing import Any
 
 from . import scripts
-from .backup import BackupCorrupt, BackupEntry, BackupStore, Manifest
+from .backup import BackupCorrupt, BackupEntry, BackupStore, Manifest, RowChange
 from .executors.base import Executor, ExecutorError, PathInfo
 from .fleet import Target
 from .health import HealthResult, check_health
@@ -35,10 +41,35 @@ from .syntax import check_staged
 from .validation import RESERVED_DIR, join_root
 
 MIN_FREE_BYTES = 64 * 1024 * 1024
+_SQL_EXIT = {3: "the database does not exist",
+             4: "the table does not exist",
+             5: "an identifier was refused by the on-target check",
+             6: "the row did not read back as written (nothing was committed)",
+             8: "a value in the row is neither text nor a number, so it cannot be backed up"}
 
 
 def marker_path(root: str, patch_id: str) -> str:
     return f"{root}/{RESERVED_DIR}/applied/{patch_id}.json"
+
+
+def _short(sha: str | None) -> str:
+    return sha[:12] if sha else "absent"
+
+
+def _row_label(path: str, change: RowChange) -> str:
+    return f"{path} row {change.table}[{change.key_column}={change.key!r}]"
+
+
+def _undo_order(entries: Iterable[BackupEntry]) -> list[BackupEntry]:
+    """One entry per path, newest step first: the earliest record holds the pre-state,
+    the latest one what was written last."""
+    first: dict[str, BackupEntry] = {}
+    for entry in entries:
+        if entry.path in first:
+            first[entry.path] = replace(first[entry.path], sha_after=entry.sha_after)
+        else:
+            first[entry.path] = entry
+    return sorted(first.values(), key=lambda e: e.step, reverse=True)
 
 
 class StepFailed(Exception):
@@ -164,13 +195,26 @@ class TargetTransaction:
 
     # -- backup, drift guard and install -------------------------------------------------
 
-    def _backup(self, step_index: int, path: str, manifest: Manifest) -> bytes | None:
-        current = self.ex.read(path)
+    def _backup(self, step_index: int, path: str, before: bytes | None, after: bytes | None,
+                manifest: Manifest, row: RowChange | None = None) -> None:
+        """Log the pre-state, and what the step is about to leave behind, before the step
+        mutates anything: whatever a crash leaves, a restore can tell this patch's bytes
+        from a later change it must not overwrite."""
         entry = BackupEntry(step_index, path,
-                            self.store.put(current) if current is not None else None)
+                            self.store.put(before) if before is not None else None,
+                            sha256(after) if after is not None else None, row)
         manifest.record(entry)              # durable *before* anything is mutated
         self._recorded.append(entry)
-        return current
+
+    def _sql(self, payload: dict[str, Any]) -> tuple[int, Any, str]:
+        """Run the on-target row program; (exit status, the row it reports, summary)."""
+        result = self.ex.run(["python3", "-c", scripts.SQL_ROW],
+                             stdin=json.dumps(payload).encode("utf-8"))
+        try:
+            row = json.loads(result.stdout).get("row") if result.stdout else None
+        except (ValueError, AttributeError):
+            row = None
+        return result.returncode, row, _SQL_EXIT.get(result.returncode, result.summary())
 
     def _drift_guard(self, step: WriteFile | AppendBlock, path: str, current: bytes | None,
                      label: str) -> str | None:
@@ -238,7 +282,8 @@ class TargetTransaction:
         path = self.path(step.dest)
         self._jail_check(path, step.label)
         self._require_parent(path, step.label)
-        current = self._backup(step.index, path, manifest)
+        current = self.ex.read(path)
+        self._backup(step.index, path, current, step.content, manifest)
         note = self._drift_guard(step, path, current, step.label)
         if current == step.content:
             return note or "already holds the shipped bytes (no change)"
@@ -250,17 +295,19 @@ class TargetTransaction:
         path = self.path(step.dest)
         self._jail_check(path, step.label)
         self._require_parent(path, step.label)
-        current = self._backup(step.index, path, manifest)
-        note = self._drift_guard(step, path, current, step.label)
+        current = self.ex.read(path)
         marker = step.marker.encode("utf-8")
         count = (current or b"").count(marker)
+        appended = step.appended_to(current or b"") if count == 0 else current
+        self._backup(step.index, path, current, appended, manifest)
+        note = self._drift_guard(step, path, current, step.label)
         if count > 1:
             raise StepFailed(step.label, f"{path} already contains the marker {count} times; "
                                          "refusing to append to a file in an unknown state")
-        if count == 1:
+        if count == 1 or appended is None:
             return note or "marker already present (no change)"
-        self._install(path, step.appended_to(current or b""), rel=step.dest,
-                      needs_compile=step.needs_compile, label=step.label)
+        self._install(path, appended, rel=step.dest, needs_compile=step.needs_compile,
+                      label=step.label)
         found = (self.ex.read(path) or b"").count(marker)
         if found != 1:
             raise StepFailed(step.label, f"expected exactly one marker after the append, "
@@ -276,19 +323,21 @@ class TargetTransaction:
             raise StepFailed(step.label, f"{path} has a non-empty write-ahead log, so a byte "
                                          "backup would not be a consistent snapshot; "
                                          "checkpoint it first")
-        self._backup(step.index, path, manifest)
-        result = self.ex.run(["python3", "-c", scripts.SQL_UPSERT],
-                             stdin=json.dumps(step.payload(path)).encode("utf-8"))
-        if not result.ok:
-            reasons = {3: f"database {path} does not exist",
-                       4: f"table {step.table!r} does not exist",
-                       5: "an identifier was refused by the on-target check",
-                       6: "the row did not read back as written"}
-            raise StepFailed(step.label, reasons.get(result.returncode, result.summary()))
-        try:
-            row = json.loads(result.stdout).get("row")
-        except (ValueError, AttributeError):
-            raise StepFailed(step.label, "the upsert returned an unreadable read-back") from None
+        code, previous, reason = self._sql({**step.payload(path), "op": "read"})
+        if code != 0:
+            raise StepFailed(step.label, f"{path}: {reason}")
+        change = RowChange(step.table, step.key_column, step.key, step.values,
+                           None if previous is None else tuple(previous.items()))
+        self._backup(step.index, path, self.ex.read(path), None, manifest, change)
+        code, row, reason = self._sql({**step.payload(path), "op": "upsert",
+                                       "previous": previous})
+        if code == 7:
+            self._recorded.pop()            # nothing was written, so there is nothing to undo
+            raise StepFailed(step.label, f"{step.table} row {step.key_column}={step.key!r} "
+                                         f"changed after it was backed up (now {row!r}); "
+                                         "nothing was written")
+        if code != 0:
+            raise StepFailed(step.label, f"{path}: {reason}")
         if row != dict(step.values):
             raise StepFailed(step.label, f"read-back {row!r} != {dict(step.values)!r}")
         return f"upserted {step.table} row {step.key_column}={step.key!r}"
@@ -365,8 +414,11 @@ class TargetTransaction:
                                  self.restore(self._recorded), health)
         return TargetOutcome(self.target.name, True, tuple(reports), health=health)
 
-    def restore(self, entries: Iterable[BackupEntry]) -> RestoreReport:
+    def restore(self, entries: Iterable[BackupEntry], *, force: bool = False) -> RestoreReport:
+        """Undo `entries`. A file or row that changed after this patch wrote it is left
+        as it is and reported, unless `force` (which overwrites that later change)."""
         restored: list[str] = []
+        rows = 0
         failed: list[str] = []
         marker = marker_path(self.root, self.patch.id)
         try:  # first: an uncleared marker would make the next run skip this target
@@ -375,15 +427,14 @@ class TargetTransaction:
                 failed.append(f"applied marker {marker} is still present")
         except ExecutorError as exc:
             failed.append(f"applied marker {marker}: {exc}")
-        first: dict[str, BackupEntry] = {}
-        for entry in entries:
-            first.setdefault(entry.path, entry)     # the earliest record is the pre-state
-        for entry in sorted(first.values(), key=lambda e: e.step, reverse=True):
+        for entry in _undo_order(entries):
+            what = _row_label(entry.path, entry.row) if entry.row else entry.path
             try:
-                self._restore_one(entry)
+                self._restore_one(entry, force=force)
                 restored.append(entry.path)
+                rows += entry.row is not None
             except (ExecutorError, BackupCorrupt, StepFailed) as exc:
-                failed.append(f"{entry.path}: {exc}")
+                failed.append(f"{what}: {exc}")
         for step in self.patch.steps:
             if isinstance(step, RunCommand) and step.command.spec.rerun_on_restore:
                 try:
@@ -395,7 +446,10 @@ class TargetTransaction:
         health = check_health(self.ex, self.target.health, sleep=self.sleep)
         ok = not failed and health.ok
         if ok:
-            detail = f"restored {len(restored)} file(s), each verified by checksum; healthy"
+            files = len(restored) - rows
+            detail = (f"restored {files} file(s), each verified by checksum"
+                      + (f", and {rows} database row(s), each read back" if rows else "")
+                      + "; healthy")
         else:
             parts = []
             if failed:
@@ -405,18 +459,72 @@ class TargetTransaction:
             detail = "PARTIAL RESTORE - " + " | ".join(parts)
         return RestoreReport(ok, tuple(restored), tuple(failed), health, detail)
 
-    def _restore_one(self, entry: BackupEntry) -> None:
+    def conflicts(self, entries: Iterable[BackupEntry]) -> list[str]:
+        """Read-only: every file or row a restore of `entries` would refuse to touch,
+        because it no longer holds what this patch wrote (nor its pre-state)."""
+        problems: list[str] = []
+        for entry in _undo_order(entries):
+            if entry.row is not None:
+                code, row, reason = self._sql(self._row_payload(entry.path, entry.row, "read"))
+                if code != 0:
+                    problems.append(f"{_row_label(entry.path, entry.row)}: cannot read it "
+                                    f"({reason})")
+                elif row not in (self._previous(entry.row), dict(entry.row.written)):
+                    problems.append(f"{_row_label(entry.path, entry.row)} changed since this "
+                                    f"patch wrote it (now {row!r})")
+                continue
+            try:
+                now = self._current_sha(entry.path)
+            except StepFailed as exc:
+                problems.append(f"{entry.path}: {exc}")
+                continue
+            if now != entry.sha_before and (entry.sha_after is None or now != entry.sha_after):
+                problems.append(f"{entry.path} {self._changed(entry, now)}")
+        return problems
+
+    def _current_sha(self, path: str) -> str | None:
+        info = self.ex.inspect(path)
+        if info.is_symlink:
+            raise StepFailed("restore", "the path became a symlink; not restoring through it")
+        current = self.ex.read(path) if info.exists else None
+        return sha256(current) if current is not None else None
+
+    @staticmethod
+    def _changed(entry: BackupEntry, now: str | None) -> str:
+        wrote = _short(entry.sha_after) if entry.sha_after else "bytes it did not record"
+        return (f"changed since this patch wrote it (sha256 now {_short(now)}, the patch "
+                f"wrote {wrote}); restoring it would overwrite that change")
+
+    @staticmethod
+    def _previous(change: RowChange) -> dict[str, Any] | None:
+        return dict(change.previous) if change.previous is not None else None
+
+    def _row_payload(self, path: str, change: RowChange, op: str,
+                     force: bool = False) -> dict[str, Any]:
+        return {"op": op, "db": path, "table": change.table, "key_column": change.key_column,
+                "key": change.key, "values": dict(change.written),
+                "previous": self._previous(change), "force": force}
+
+    def _restore_one(self, entry: BackupEntry, *, force: bool = False) -> None:
+        if entry.row is not None:
+            code, row, reason = self._sql(self._row_payload(entry.path, entry.row, "restore",
+                                                            force))
+            if code == 7:
+                raise StepFailed("restore", f"changed since this patch wrote it (now {row!r}); "
+                                            "restoring it would overwrite that change")
+            if code != 0:
+                raise StepFailed("restore", reason)
+            return
+        now = self._current_sha(entry.path)
+        if now == entry.sha_before:
+            return                              # already the pre-state
+        if not force and (entry.sha_after is None or now != entry.sha_after):
+            raise StepFailed("restore", self._changed(entry, now))
         if entry.sha_before is None:            # the transaction created this file
             self.ex.remove(entry.path)
             if self.ex.inspect(entry.path).exists:
                 raise StepFailed("restore", "the file this patch created could not be removed")
             return
-        info = self.ex.inspect(entry.path)
-        if info.is_symlink:
-            raise StepFailed("restore", "the path became a symlink; not restoring through it")
-        current = self.ex.read(entry.path) if info.exists else None
-        if current is not None and sha256(current) == entry.sha_before:
-            return                              # never changed: already the pre-state
         data = self.store.get(entry.sha_before)     # refuses a backup that fails its checksum
         self._swap_in(entry.path, data, "restore")
 

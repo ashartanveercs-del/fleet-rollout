@@ -185,6 +185,20 @@ def test_rollback_restores_one_target(project):
     assert project.greeting("agent-02") == OLD_GREETING
 
 
+def test_rollback_refuses_to_overwrite_a_later_change_unless_forced(project):
+    project.run("apply", project.patch, "--fleet", project.fleet_file, "--ticket", "CHG-1042",
+                "--operator", "ops.oncall")
+    project.agents["agent-02"].put("/srv/agent/config/greeting.txt", b"edited later by hand\n")
+    argv = ["rollback", project.patch, "--fleet", project.fleet_file, "--target", "agent-02",
+            "--ticket", "CHG-1042", "--operator", "ops.oncall"]
+    code, _, err = project.run(*argv)
+    assert code == 3 and "changed since" in err and "--force" in err
+    assert project.greeting("agent-02") == b"edited later by hand\n"
+    code, out, _ = project.run(*argv, "--force")
+    assert code == 0, out
+    assert project.greeting("agent-02") == OLD_GREETING
+
+
 def test_drift_shows_unified_diffs_and_exits_1(project):
     code, out, _ = project.run("drift", "--fleet", project.fleet_file)
     assert code == 0 and "in sync" in out

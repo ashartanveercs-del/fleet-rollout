@@ -92,7 +92,7 @@ FLEET_CLI_OPTIONS: Mapping[str, Mapping[str, bool]] = {
               "--include-customer": False, "--ticket": True, "--operator": True,
               "--allow-drift": False, "--bake": True},
     "rollback": {"--fleet": True, "--state": True, "--target": True, "--ticket": True,
-                 "--operator": True, "--include-customer": False},
+                 "--operator": True, "--include-customer": False, "--force": False},
     "unlock": {"--fleet": True, "--state": True, "--run-lock": False, "--ticket": True,
                "--operator": True},
 }
@@ -101,6 +101,10 @@ FLEET_FORBIDDEN = {
     "approve": "approvals must be recorded by people, not by an agent session",
     "clear-halt": "clearing a halt is a human decision, made after investigating why the "
                   "rollout stopped",
+}
+FLEET_FORBIDDEN_OPTIONS = {
+    ("rollback", "--force"): "overwriting changes made after a patch (a later patch, a hand "
+                             "edit, the agent's own data) is a human decision",
 }
 _WRITE_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", "<>"})
 _HARMLESS_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
@@ -1128,6 +1132,10 @@ def _fleet_cli(args: list[Word], scope: Scope) -> list[Finding]:
         else:
             positional.append(word)
         i += 1
+    forbidden = next(((name, why) for (verb, name), why in FLEET_FORBIDDEN_OPTIONS.items()
+                      if verb == sub and name in given), None)
+    if forbidden:
+        return [Finding("forbidden", f"`fleet-rollout {sub} {forbidden[0]}`: {forbidden[1]}")]
     pinned = _fleet_cli_pinned(sub, given, scope)
     if pinned:
         return [pinned]

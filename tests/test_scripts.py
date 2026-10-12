@@ -32,11 +32,15 @@ def settings_db(tmp_path):
     return path
 
 
-def upsert(db, **overrides):
-    payload = {"db": str(db), "table": "settings", "key_column": "name",
+def row_op(db, op, **overrides):
+    payload = {"op": op, "db": str(db), "table": "settings", "key_column": "name",
                "key": "invoice_template", "values": {"value": "v2", "rev": 2}}
     payload.update(overrides)
-    return run_snippet(scripts.SQL_UPSERT, stdin=json.dumps(payload).encode())
+    return run_snippet(scripts.SQL_ROW, stdin=json.dumps(payload).encode())
+
+
+def upsert(db, **overrides):
+    return row_op(db, overrides.pop("op", "upsert"), **overrides)
 
 
 def rows(db):
@@ -84,11 +88,72 @@ def test_missing_database_exits_3_and_is_not_created(tmp_path):
     {"key_column": "name = name OR 1"},
     {"values": {"value; DROP TABLE settings": "x"}},
     {"table": "sqlite_master"},
+    {"values": {}},
+    {"op": "drop"},
 ])
 def test_the_script_rechecks_identifiers_itself(settings_db, override):
     before = settings_db.read_bytes()
     assert upsert(settings_db, **override).returncode == 5
     assert settings_db.read_bytes() == before
+
+
+def test_read_returns_the_current_values_and_writes_nothing(settings_db):
+    before = settings_db.read_bytes()
+    result = row_op(settings_db, "read", key="greeting", values={"value": "x", "rev": 0})
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["row"] == {"value": "Hello", "rev": 1}
+    assert json.loads(row_op(settings_db, "read").stdout)["row"] is None    # no such row
+    assert settings_db.read_bytes() == before
+
+
+def test_upsert_refuses_a_row_that_changed_since_it_was_read(settings_db):
+    before = settings_db.read_bytes()
+    result = upsert(settings_db, key="greeting", values={"value": "Hi"},
+                    previous={"value": "Howdy"})
+    assert result.returncode == 7
+    assert settings_db.read_bytes() == before
+
+
+def test_restore_puts_back_only_the_columns_the_patch_wrote(settings_db):
+    assert upsert(settings_db, key="greeting", values={"value": "Hi"}).returncode == 0
+    result = row_op(settings_db, "restore", key="greeting", values={"value": "Hi"},
+                    previous={"value": "Hello"})
+    assert result.returncode == 0, result.stderr
+    assert ("greeting", "Hello", 1) in rows(settings_db)
+
+
+def test_restore_deletes_a_row_the_patch_inserted(settings_db):
+    assert upsert(settings_db).returncode == 0
+    assert row_op(settings_db, "restore", previous=None).returncode == 0
+    assert [r for r in rows(settings_db) if r[0] == "invoice_template"] == []
+    assert ("greeting", "Hello", 1) in rows(settings_db)
+
+
+def test_restore_refuses_a_row_changed_after_the_patch_unless_forced(settings_db):
+    assert upsert(settings_db, key="greeting", values={"value": "Hi"}).returncode == 0
+    assert upsert(settings_db, key="greeting", values={"value": "Hey"}).returncode == 0
+    payload = {"key": "greeting", "values": {"value": "Hi"}, "previous": {"value": "Hello"}}
+    result = row_op(settings_db, "restore", **payload)
+    assert result.returncode == 7
+    assert json.loads(result.stdout)["row"] == {"value": "Hey"}
+    assert ("greeting", "Hey", 1) in rows(settings_db)
+    assert row_op(settings_db, "restore", force=True, **payload).returncode == 0
+    assert ("greeting", "Hello", 1) in rows(settings_db)
+
+
+def test_restore_of_a_row_already_in_its_pre_state_changes_nothing(settings_db):
+    result = row_op(settings_db, "restore", key="greeting", values={"value": "Hi"},
+                    previous={"value": "Hello"})
+    assert result.returncode == 0
+    assert ("greeting", "Hello", 1) in rows(settings_db)
+
+
+def test_values_that_are_neither_text_nor_numbers_are_refused(settings_db):
+    con = sqlite3.connect(settings_db)
+    con.execute("UPDATE settings SET value = x'00ff' WHERE name = 'greeting'")
+    con.commit()
+    con.close()
+    assert row_op(settings_db, "read", key="greeting", values={"value": "x"}).returncode == 8
 
 
 # -- compile check ---------------------------------------------------------------------
