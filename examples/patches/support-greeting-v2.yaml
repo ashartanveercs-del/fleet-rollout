@@ -1,0 +1,29 @@
+# A routine change: new greeting, one new support rule, a settings row, then a reload.
+# Validate it with:  fleet-rollout validate examples/patches/support-greeting-v2.yaml
+id: support-greeting-v2
+description: Friendlier support greeting, a refund rule, and the v2 invoice template
+steps:
+  - kind: write_file
+    source: files/support-greeting-v2/greeting.txt
+    dest: config/greeting.txt
+    # refuse any target whose greeting was hand-edited since this patch was written
+    expect_sha256: ff10fbb4401adefa8d19a84c205b83b5f3811d8712bed23e555dd93f17b81c7a
+
+  - kind: append_block
+    source: files/support-greeting-v2/refund-rule.md
+    dest: prompts/support.md
+    marker: "<!-- rule: refunds-v2 -->"
+
+  - kind: sql_upsert
+    db: data/settings.db
+    table: settings
+    key_column: name
+    key: invoice_template
+    values: {value: v2}
+
+  - kind: run
+    command: reload_agent       # SIGHUP to PID 1; re-run automatically after a restore
+
+verify:
+  - file: config/greeting.txt
+    contains: Thanks for reaching out

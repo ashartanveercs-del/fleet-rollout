@@ -1,0 +1,14 @@
+# A spec that is refused at load time, before any plan exists. `fleet-rollout validate`
+# reports the first problem; each of these would be refused on its own:
+#   dest: ../../etc/cron.d/backdoor      climbs out of the workspace jail
+#   dest: /etc/passwd                    absolute paths cannot be expressed
+#   kind: shell                          there is no free-text command step
+#   command: bash                        `run` only names allowlisted commands
+#   table: "settings; DROP TABLE users"  SQL identifiers are allowlisted
+#   a second `dest:` key in one step     duplicate YAML keys are rejected
+id: hostile-example
+description: Looks like a routine greeting change
+steps:
+  - kind: write_file
+    source: files/support-greeting-v2/greeting.txt
+    dest: ../../etc/cron.d/backdoor

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.env
+# operator-side state written by a real rollout (ledger, backups, approvals, locks)
+.fleet-state/

@@ -1,0 +1,1 @@
+- Refunds over $50 need a manager's approval.

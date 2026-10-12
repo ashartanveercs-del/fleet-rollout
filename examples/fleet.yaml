@@ -1,0 +1,50 @@
+# A fictional fleet: five support agents for small businesses, each in its own container
+# on an example.com host. Nothing here points at real infrastructure.
+fleet: support-agents
+golden: golden              # the intended workspace, rendered per target
+tickets_dir: tickets        # change tickets required by `apply` and by the guard hook
+state_dir: .fleet-state     # ledger, approvals and backups (keep it on durable storage)
+
+defaults:
+  executor: ssh             # ssh to the host, then `docker exec` into the container
+  root: /srv/agent          # every patch path is relative to this jail
+  health:
+    port: 8080
+    path: /healthz
+    expect_json: {status: ok}   # the body must say ok; a bare 200 is not health
+    retries: 3
+    interval_seconds: 2
+
+targets:
+  - name: agent-01
+    host: edge-1.example.com
+    owner: internal
+    cohort: staff
+    canary: true            # the target we are willing to break first
+    vars: {region: us-east}
+
+  - name: agent-02
+    host: edge-1.example.com
+    owner: internal
+    cohort: staff
+    vars: {region: us-east}
+
+  - name: agent-03
+    host: edge-2.example.com
+    owner: customer         # held back unless --include-customer, then 2 approvals
+    customer: Example Bakery
+    cohort: bakeries
+    vars: {region: us-west}
+
+  - name: agent-04
+    host: edge-2.example.com
+    owner: internal
+    cohort: bakeries
+    container: support-agent-04
+    vars: {region: us-west}
+
+  - name: agent-05
+    host: edge-3.example.com
+    owner: internal
+    cohort: cafes
+    vars: {region: eu-central}

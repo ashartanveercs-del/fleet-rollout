@@ -1,0 +1,12 @@
+# A change that passes every static check and still breaks the agent: the new config is
+# valid JSON, but it renames `enabled` to `is_enabled`, which the running agent does not
+# know. The agent keeps answering HTTP 200 and reports {"status": "degraded"} in the body.
+# The rollout catches that on the canary, restores it, and halts.
+id: agent-config-v3
+description: Move the agent to the v3 config schema
+steps:
+  - kind: write_file
+    source: files/agent-config-v3/agent.json
+    dest: config/agent.json
+  - kind: run
+    command: reload_agent

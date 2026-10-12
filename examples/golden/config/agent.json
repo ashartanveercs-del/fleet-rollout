@@ -1,0 +1,6 @@
+{
+  "model": "small",
+  "temperature": 0.2,
+  "escalate_to": "support@example.com",
+  "enabled": true
+}

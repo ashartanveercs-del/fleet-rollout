@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fleet-rollout"
+version = "0.1.0"
+description = "Transactional patch rollouts for fleets of containerized AI agents: hostile-YAML validation, per-target backup/verify/restore, canary-then-cohort waves, a hash-chained ledger, and a fail-closed guard hook for AI coding agents."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Ashar Tanveer" }]
+keywords = ["fleet-management", "rollout", "canary", "docker", "ssh", "ai-agents", "claude-code", "hooks"]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+fleet-rollout = "fleet_rollout.cli:main"
+fleet-rollout-guard = "fleet_rollout.guard.hook:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fleet_rollout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM"]
+ignore = [
+    "S101",  # assert is how pytest works
+    "S603",  # subprocess with a list argv is the whole point of the executors
+    "S607",  # `docker` / `ssh` are resolved from PATH on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S108", "S311"]
+"examples/*" = ["S108"]

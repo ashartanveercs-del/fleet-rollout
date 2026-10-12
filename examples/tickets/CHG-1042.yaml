@@ -1,0 +1,8 @@
+# A change ticket. `fleet-rollout apply --ticket CHG-1042` and the guard hook
+# (`CHANGE_TICKET=CHG-1042 <command>`) both check it. Real tickets should expire within
+# days; this example expires far in the future so the demo keeps working.
+id: CHG-1042
+summary: Roll support-greeting-v2 to the support agents
+targets: ['*', agent-03]      # '*' never covers customer-owned targets: name them
+expires: 2099-12-31T00:00:00Z
+approved_by: [ops.oncall, eng.lead]
