@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -54,6 +55,8 @@ def project(tmp_path):
     # Two scripts with the same name: which one runs depends on the working directory.
     (tmp_path / "status.sh").write_text("#!/bin/sh\ndocker ps\n")
     (tmp_path / "scripts" / "status.sh").write_text("#!/bin/sh\ndocker restart agent-01\n")
+    (tmp_path / ".fleet-state").mkdir()
+    (tmp_path / ".fleet-state" / "ledger.jsonl").write_text("")
     return tmp_path
 
 
@@ -289,6 +292,103 @@ def test_write_and_edit_tools_cannot_touch_protected_files(project):
     ok = hook(project, {"tool_name": "Write", "cwd": str(project),
                         "tool_input": {"file_path": "src/app.py", "content": "x"}})
     assert ok is None
+
+
+# -- protected paths are compared by where they really are -------------------------------
+
+
+def make_alias(link, target):
+    """A directory alias: a symlink, or an NTFS junction where Windows withholds the
+    symlink privilege. The OS follows either one."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+
+
+def test_a_write_through_an_alias_of_a_protected_directory_is_denied(project):
+    # Regression: paths were compared after normpath only, so an alias the agent could
+    # create (`ln -s . alias` was allowed) reached the tickets, approvals and ledger.
+    make_alias(project / "alias", project)
+    for tool, path in [("Write", "alias/tickets/CHG-9999.yaml"),
+                       ("Edit", str(project / "alias" / ".fleet-state" / "approvals.jsonl"))]:
+        result = hook(project, {"tool_name": tool, "cwd": str(project),
+                                "tool_input": {"file_path": path, "content": "x"}})
+        assert "protected" in denied(result), path
+    assert "protected" in denied(bash(project, "echo 'id: CHG-9999' > alias/tickets/CHG-9999.yaml"))
+    assert "protected" in denied(bash(project, "cp /tmp/forged.yaml alias/fleet.yaml"))
+
+
+def test_protected_paths_match_in_any_case(project):
+    # On a case-insensitive filesystem TICKETS/ is tickets/.
+    assert "protected" in denied(bash(project, "echo x > TICKETS/CHG-9999.yaml"))
+    assert "protected" in denied(bash(project, "rm .Fleet-State/ledger.jsonl"))
+    write = hook(project, {"tool_name": "Write", "cwd": str(project),
+                           "tool_input": {"file_path": "Fleet.YAML", "content": "x"}})
+    assert "protected" in denied(write)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Git Bash drive paths exist only on Windows")
+def test_git_bash_drive_paths_are_the_windows_paths_they_stand_for(project):
+    drive, rest = os.path.splitdrive(str(project / "tickets" / "CHG-9999.yaml"))
+    msys = f"/{drive[0].lower()}{rest.replace(os.sep, '/')}"
+    assert "protected" in denied(bash(project, f"echo x > {msys}"))
+
+
+PROTECTED_DENY = [
+    "ln -s . alias",                                    # an alias of everything below
+    "ln -s .. up",
+    "ln -s tickets t",
+    "ln -sfn ../tickets scripts/t",                     # relative to the link's directory
+    "ln tickets/CHG-1042.yaml copy.yaml",               # a hard link is the same file
+    "cp -rs . mirror",
+    "cp -al . snapshot",
+    "mount --bind . /mnt/x",
+    "sudo mount -o bind,ro . /mnt/x",
+    "bindfs . /mnt/x",
+    "cmd //c mklink /J alias .",
+    "chmod -R a+w .",
+    "cd tickets && echo x > CHG-9999.yaml",             # relative to where `cd` went
+    "cd .fleet-state; rm ledger.jsonl",
+    "pushd tickets && rm CHG-1042.yaml",
+    "rm -rf *",                                         # what the shell expands it to
+    "rm -f t*/*.yaml",
+    "rm -rf .fleet-*",
+    "rm -rf {tickets,build}",
+]
+
+
+@pytest.mark.parametrize("command", PROTECTED_DENY)
+def test_aliases_moves_and_expansions_of_protected_paths_are_denied(project, command):
+    message = denied(bash(project, command))
+    assert message is not None and "protected" in message, command
+
+
+PROTECTED_ALLOW = [
+    "ln -s ../shared/config.yaml config.yaml",
+    "cp -r . /tmp/backup",
+    "rm -rf build dist",
+    "rm -f *.pyc",
+    "chmod -R u+x scripts",
+    "mv notes.txt notes.md",
+    "cd scripts && rm -f report.log",
+    "cd tickets && cat CHG-1042.yaml",                  # changing directory writes nothing
+]
+
+
+@pytest.mark.parametrize("command", PROTECTED_ALLOW)
+def test_ordinary_file_work_stays_allowed(project, command):
+    assert bash(project, command) is None
+
+
+def test_moving_or_deleting_the_directory_that_holds_protected_files_is_denied(project):
+    name = project.name
+    for command in (f"rm -rf ../{name}", f"mv {project.as_posix()} /tmp/moved"):
+        message = denied(bash(project, command))
+        assert message is not None and "protected" in message, command
 
 
 def test_a_payload_cwd_that_does_not_exist_fails_closed(project):

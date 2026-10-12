@@ -20,6 +20,7 @@ can authorize what cannot be named, nor let an agent edit its own authorization.
 from __future__ import annotations
 
 import contextlib
+import glob
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -45,7 +46,7 @@ READ_ONLY = frozenset({
     "sha256sum", "sha1sum", "md5sum", "cksum", "sort", "uniq", "cut", "tr", "rev", "jq",
     "diff", "cmp", "column", "nl", "od", "xxd", "hexdump", "strings", "basename", "dirname",
     "realpath", "readlink", "which", "type", "sleep", "nproc", "lsof", "netstat", "ss",
-    "getent", "env", "vmstat", "iostat", "dmesg",
+    "getent", "env", "vmstat", "iostat", "dmesg", "cd", "pushd", "popd",
 })
 LOCAL_ONLY = READ_ONLY | frozenset({
     "git", "cd", "pushd", "popd", "export", "unset", "set", "alias", "read", "shift", "exit",
@@ -138,6 +139,12 @@ class Inventory:
             r"(?<![A-Za-z0-9_-])(" + "|".join(re.escape(t) for t in tokens) + r")(?![A-Za-z0-9_-])",
             re.IGNORECASE) if tokens else None
         self.protected = tuple(Path(os.path.normpath(os.path.abspath(p))) for p in protected)
+        # Each root as written and as it really is on disk (symlinks and junctions
+        # resolved), compared case-insensitively: a case-insensitive filesystem treats
+        # TICKETS/ as tickets/, and an alias reaches the same files as the real path.
+        self._roots = tuple(dict.fromkeys(form for root in self.protected
+                                          for form in (root, _real(root))))
+        self._root_keys = tuple(dict.fromkeys(_key(root) for root in self._roots))
 
     def by_container(self, token: str) -> frozenset[str]:
         return frozenset(self._containers.get(token.lower(), ()))
@@ -155,23 +162,91 @@ class Inventory:
                 found |= self._containers.get(key, set()) | self._hosts.get(key, set())
         return frozenset(found)
 
-    def protected_hit(self, text: str, cwd: Path) -> bool:
+    def relation(self, path: Path) -> str | None:
+        """"inside" if `path` is a protected root or below one, "ancestor" if a protected
+        root is below it, else None. Both its written and its real location count."""
+        keys = {_key(path), _key(_real(path))}
+        if any(key[:len(root)] == root for key in keys for root in self._root_keys):
+            return "inside"
+        if any(root[:len(key)] == key for key in keys for root in self._root_keys):
+            return "ancestor"
+        return None
+
+    def protected_hit(self, text: str, cwd: Path | Iterable[Path], *,
+                      ancestors: bool = False, expand: bool = False) -> bool:
+        """Whether `text`, an argument, a redirection target or a file path from a tool
+        call, names a protected path (or, with `ancestors`, a directory holding one).
+        `expand`: the shell expands it (an unquoted glob or brace expression)."""
         if not self.protected or not text:
             return False
+        cwds = [cwd] if isinstance(cwd, Path) else list(cwd)
         if not re.search(r"[\s'\"();|&<>`$]", text):          # a plain path argument
-            path = Path(os.path.expanduser(text))
-            path = Path(os.path.normpath(path if path.is_absolute() else cwd / path))
-            return any(path == root or root in path.parents for root in self.protected)
+            wanted = ("inside", "ancestor") if ancestors else ("inside",)
+            return any(self.relation(place) in wanted
+                       for place in _places(text, cwds, expand=expand))
         normalized = text.replace("\\", "/")                     # code: look for the names
-        for root in self.protected:
+        for root in self._roots:
             forms = {root.as_posix()}
-            with contextlib.suppress(ValueError):       # not under cwd: absolute form only
-                forms.add(root.relative_to(cwd).as_posix())
-            for form in forms:
+            for base in cwds:
+                with contextlib.suppress(ValueError):   # not under cwd: absolute form only
+                    forms.add(root.relative_to(base).as_posix())
+            for form in forms - {"."}:
                 if re.search(r"(?<![A-Za-z0-9_.-])" + re.escape(form) + r"(?![A-Za-z0-9_-])",
-                             normalized):
+                             normalized, re.IGNORECASE):
                     return True
         return False
+
+
+def _real(path: Path) -> Path:
+    try:
+        return Path(os.path.realpath(path))
+    except (OSError, ValueError):
+        return path
+
+
+def _key(path: Path) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in Path(os.path.normcase(path)).parts)
+
+
+def _native(text: str) -> str:
+    """Git Bash on Windows hands `/d/work/x` (or `/cygdrive/d/...`) to native programs as
+    `D:/work/x`; Python on its own would read it as a folder on the current drive."""
+    if os.name == "nt":
+        match = re.match(r"/(?:cygdrive/)?([A-Za-z])(?=/|$)", text)
+        if match:
+            return f"{match.group(1).upper()}:/" + text[match.end():].lstrip("/")
+    return text
+
+
+def _braces(text: str) -> list[str]:
+    """Shell brace expansion (`{a,b}`), one group at a time; at most 64 results."""
+    match = re.search(r"\{([^{}]*,[^{}]*)\}", text)
+    if not match:
+        return [text]
+    out: list[str] = []
+    for choice in match.group(1).split(","):
+        out += _braces(text[:match.start()] + choice + text[match.end():])
+        if len(out) >= 64:
+            break
+    return out[:64]
+
+
+def _places(text: str, cwds: Sequence[Path], *, expand: bool) -> list[Path]:
+    """Every location a plain path argument can stand for, from each directory the shell
+    may be in: after `~` and Git Bash drive paths and, for a word the shell expands,
+    braces and globs (keeping the literal too, since an unmatched glob is passed as is)."""
+    places: list[Path] = []
+    for variant in _braces(text) if expand else [text]:
+        path = Path(os.path.expanduser(_native(variant)))
+        bases = [None] if path.is_absolute() else cwds
+        for base in bases:
+            full = path if base is None else base / path
+            places.append(Path(os.path.normpath(full)))
+            if expand and any(ch in variant for ch in "*?["):
+                with contextlib.suppress(OSError, ValueError, re.error):
+                    places += [Path(os.path.normpath(m))
+                               for m in glob.glob(str(full), recursive=False)[:256]]
+    return places
 
 
 # -- findings and scope ---------------------------------------------------------------------
@@ -756,11 +831,22 @@ def _command(command: Command, scope: Scope) -> list[Finding]:
 
 
 def _protected(prog: str, args: list[Word], command: Command, scope: Scope) -> list[Finding]:
-    candidates = _texts(args) + [r.target.text for r in command.redirects
-                                 if r.op not in ("<<", "<<-")]
-    hit = next((text for text in candidates if scope.inv.protected_hit(text, scope.cwd)), None)
+    candidates = list(args) + [Word(w.text.split("=", 1)[1], w.dynamic, w.quoted)
+                               for w in args if w.text.startswith("-") and "=" in w.text]
+    candidates += [r.target for r in command.redirects if r.op not in ("<<", "<<-")]
+    hit = next((w.text for w in candidates
+                if scope.inv.protected_hit(w.text, scope.cwds, expand=w.dynamic)), None)
     if hit is None:
-        return []
+        reach = next((word.text for word, bases in _tree_reach(prog, args, scope)
+                      if scope.inv.protected_hit(word.text, bases, ancestors=True,
+                                                 expand=word.dynamic)), None)
+        if reach is None:
+            return []
+        return [Finding("protected", f"`{prog}` would link to or act on everything under "
+                                     f"`{reach}`, which holds protected files: change "
+                                     "tickets, approvals, the ledger, the fleet file and the "
+                                     "hook settings are changed by people, not by an agent "
+                                     "session")]
     git_read = prog == "git" and bool(args) and args[0].text in {"status", "diff", "log", "show",
                                                                  "blame"}
     if (_is_read_only(prog, args, command) or git_read) and not _writes(command):
@@ -768,6 +854,47 @@ def _protected(prog: str, args: list[Word], command: Command, scope: Scope) -> l
     return [Finding("protected", f"`{hit}` is protected: change tickets, approvals, the ledger, "
                                  "the fleet file and the hook settings are changed by people, "
                                  "not by an agent session")]
+
+
+def _tree_reach(prog: str, args: list[Word], scope: Scope) -> list[tuple[Word, list[Path]]]:
+    """Operands through which `prog` reaches everything below a directory, with the
+    directories they are relative to: a link (symbolic, hard, bind mount, junction) is
+    an alias the guard would not recognize later, and a recursive delete, move or
+    permission change acts on every file inside."""
+    texts = _texts(args)
+    options = [t for t in texts if t.startswith("-") and t != "-"]
+    operands = [w for w in args if not (w.text.startswith("-") and w.text != "-")]
+    shorts = set("".join(o[1:] for o in options if not o.startswith("--")))
+    longs = {o.split("=", 1)[0] for o in options if o.startswith("--")}
+    cwds = list(scope.cwds)
+    every = [(w, cwds) for w in operands]
+    if prog in ("ln", "link"):
+        if ("s" in shorts or "--symbolic" in longs) and operands:
+            # A symlink's target is read relative to the directory the link lands in.
+            *targets, link = operands if len(operands) > 1 else [operands[0], Word(".")]
+            homes = []
+            for cwd in cwds:
+                place = cwd / os.path.expanduser(link.text)
+                homes.append(place if place.is_dir() else place.parent)
+            every += [(w, homes) for w in targets]
+        return every
+    if prog == "cp" and (shorts & {"s", "l"} or longs & {"--symbolic-link", "--link"}):
+        return every
+    if prog == "mount" and (shorts & {"B", "R", "M"} or longs & {"--bind", "--rbind", "--move"}
+                            or any("bind" in t for t in texts)):
+        return every
+    if prog in ("bindfs", "mklink") or (prog in ("cmd", "cmd.exe") and "mklink" in
+                                        " ".join(texts).lower()):
+        words = " ".join(texts).split()
+        start = next((i + 1 for i, w in enumerate(words) if w.lower() == "mklink"), 0)
+        return [(Word(w), cwds) for w in words[start:] if not re.fullmatch(r"/[A-Za-z]", w)]
+    if prog == "rm" and (shorts & {"r", "R"} or "--recursive" in longs):
+        return every
+    if prog == "mv":
+        return every
+    if prog in ("chmod", "chown", "chgrp", "setfacl") and ("R" in shorts or "--recursive" in longs):
+        return every
+    return []
 
 
 def _find_exec(args: list[Word], scope: Scope) -> list[Finding]:

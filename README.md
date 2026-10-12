@@ -46,7 +46,7 @@ the body, and only the body check caught it.
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
 | **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 626 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 657 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
 
 ## Architecture
 
@@ -307,7 +307,8 @@ Install it with the settings in [`examples/claude-settings.json`](examples/claud
 | `fleet-rollout approve …`, `fleet-rollout clear-halt …`, `fleet-rollout rollback … --force` | denied: those are human decisions |
 | `fleet-rollout apply … --state /tmp/x`, `--fleet other.yaml`, `cd elsewhere && fleet-rollout apply …` | denied: a mutation must use the fleet file the guard protects and that fleet's state directory, or it could bring its own targets, tickets, approvals and halts |
 | `uv run fleet-rollout …`, `python -c` code that imports `fleet_rollout`, an abbreviated option | denied: run the CLI directly, with options spelled out |
-| writing tickets, the state dir, the fleet file or `.claude/settings*.json` (Bash or Write/Edit) | denied |
+| writing tickets, the state dir, the fleet file or `.claude/settings*.json` (Bash or Write/Edit), also through a symlink or junction, in another letter case, after a `cd`, or via a glob that expands to them | denied |
+| `ln -s . alias`, `cp -rs`, `mount --bind`, `mklink /J`, `rm -r`, `mv` or `chmod -R` on a directory that holds protected files | denied: an alias, or an operation on everything inside |
 | a payload it cannot read, a command it cannot parse, an unknown `cwd`, an internal error | denied (fail closed) |
 
 A ticket (`tickets/CHG-1042.yaml`) lists the targets it covers, its approvers and an
@@ -319,7 +320,7 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 626 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # 657 tests, under a minute, offline; no Docker, SSH or keys
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```
@@ -356,6 +357,12 @@ all of them on Linux.
   is credentials: an agent session should not hold production SSH keys or a production
   Docker socket. Pair the hook with OS permissions that make the tickets and state
   directories read-only to the agent's user.
+- **Protected paths are matched where they really are:** symlinks and junctions are
+  resolved, letter case is ignored, globs and braces are expanded the way the shell
+  would, and relative paths are tried from every directory a `cd` may have moved to.
+  What the guard cannot see is a directory change or a path computed at run time, a
+  path built inside a program, or files that an archive, `git checkout` or
+  `find -delete` reaches without naming them. OS permissions cover those.
 - **Approvals and tickets are files.** The guard stops an agent from writing them. People
   with write access to the state directory can still edit `approvals.jsonl`. The ledger
   records which approvals each customer-target transaction relied on, so edits are
