@@ -70,6 +70,29 @@ def test_unreadable_lock_content_counts_as_held(fx):
     assert state.state == "held" and state.owner is None
 
 
+@pytest.mark.parametrize("stamp", ["2026-10-12T10:00:00", "not-a-date"])
+def test_a_lock_with_an_unusable_timestamp_is_held_without_guessing_its_age(fx, stamp):
+    data = LockOwner("r-1", "ops.oncall", "support-greeting-v2", stamp).to_bytes()
+    fx.put(lock_path(ROOT), data)
+    state = probe(fx, ROOT, now=T0 + timedelta(hours=3))
+    assert state.state == "held" and state.age_seconds is None
+    with pytest.raises(LockHeld) as err:
+        acquire(fx, ROOT, owner("r-2"), now=T0 + timedelta(hours=3))
+    assert not err.value.stale
+    assert fx.files[lock_path(ROOT)] == data
+
+
+@pytest.mark.parametrize("stamp", ["2026-10-12T10:00:00", "not-a-date"])
+def test_a_local_lock_with_an_unusable_timestamp_still_refuses_another_run(tmp_path, stamp):
+    lock = LocalRunLock(tmp_path / "run.lock")
+    data = LockOwner("r-1", "ops.oncall", "support-greeting-v2", stamp).to_bytes()
+    lock.path.write_bytes(data)
+    with pytest.raises(LockHeld) as err:
+        lock.acquire(owner("r-2"), now=T0 + timedelta(hours=3))
+    assert err.value.age_seconds is None and not err.value.stale
+    assert lock.path.read_bytes() == data
+
+
 def test_release_only_removes_our_own_lock(fx):
     acquire(fx, ROOT, owner("r-1"))
     assert release(fx, ROOT, "r-2") is False

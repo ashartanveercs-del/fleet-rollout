@@ -73,7 +73,10 @@ def _age(owner: LockOwner | None, now: datetime) -> int | None:
     if owner is None:
         return None
     try:
-        return int((now - datetime.fromisoformat(owner.acquired_at)).total_seconds())
+        acquired = datetime.fromisoformat(owner.acquired_at)
+        if acquired.tzinfo is None:
+            return None  # do not guess a zone, a staleness age, or permission to break it
+        return int((now - acquired).total_seconds())
     except ValueError:
         return None
 

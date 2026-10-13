@@ -1,17 +1,39 @@
 # fleet-rollout
 
-**Transactional patch rollouts for fleets of containerized AI agents.** You describe a
-change once, in a YAML patch spec. `fleet-rollout` validates the spec as hostile input,
-then rolls it out canary first, one target at a time. Every target is a transaction:
-backed up, swapped in, read back, and health-checked on the response *body*. A failure
-restores that target from its checksummed backup and halts the rollout. Everything goes
-into a hash-chained ledger.
+**Review one patch. Rehearse failures. Roll out canary first.**
 
-It also ships a fail-closed **Claude Code PreToolUse hook** that stops an AI coding agent
-from changing live containers unless the command carries an explicit change ticket.
+A Python rollout engine for fleets of containerized agents. Strict YAML describes changes;
+fixed commands execute them. Each target gets a write-ahead backup, staged writes,
+read-back verification and a health check on the response body. A failed canary restores
+the recorded pre-state and halts later targets; an unproven restore is reported explicitly.
+The hash-chained ledger records both outcomes and recovery decisions.
 
+Includes a **Claude Code PreToolUse hook** that requires scoped change tickets for recognized
+fleet mutations. Its shell analysis is a guardrail; the [credential and filesystem
+boundaries](#security-notes) remain essential.
+
+[![CI](https://github.com/ashartanveercs-del/fleet-rollout/actions/workflows/ci.yml/badge.svg)](https://github.com/ashartanveercs-del/fleet-rollout/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
+**Five-target rehearsal · row-level SQLite recovery · shared fake/real executor contracts**
+
+[Try it](#try-it-offline) · [Transactions](#architecture) · [CLI](#quick-start) ·
+[Proof map](docs/PROOF_MAP.md) · [Verification record](docs/VERIFICATION.md) ·
+[Trust boundaries](#security-notes)
+
+## Try it offline
+
+From a checkout, with Python 3.11+. No Docker daemon, SSH host or credentials required:
+
+```bash
+python -m pip install -e ".[dev]"
+python examples/rehearse_rollout.py
+```
+
+The real CLI drives five simulated containers through drift detection, two-person customer
+approval and a successful rollout. Then a syntactically valid config breaks the canary's
+health response, exercising restore and halt:
 
 ```text
 $ fleet-rollout apply patches/support-greeting-v2.yaml --ticket CHG-1042 --include-customer
@@ -46,7 +68,7 @@ the body, and only the body check caught it.
 | **Consent gates** | Customer-owned targets are held back unless explicitly included. Then they need **two approvals from two different people**, bound to the patch's digest, which covers the spec and every bundled byte. |
 | **Guard hook for AI agents** | A PreToolUse hook that lexes shell commands, follows `ssh`, `docker exec`, `sh -c`, heredocs, `cd`, `sudo`/`env`/`xargs` and friends, and denies anything that would change a live container unless it carries a valid change ticket. It fails closed. |
 | **Executors** | A small file-and-command interface with adapters for local `docker exec` and `docker exec` over SSH, plus an in-memory fake. The fake is held to the same contract tests as the real adapter running under a real `sh`. |
-| **Tested without Docker** | 745 tests, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. |
+| **Tested without Docker** | 749 test cases, offline, no keys. Includes real SQLite row upserts and restores, real shell scripts, and a loopback HTTP server. Platform-specific cases and actual results are listed in the [verification record](docs/VERIFICATION.md). |
 
 ## Architecture
 
@@ -326,13 +348,14 @@ permission prompts.
 ## Testing
 
 ```bash
-pytest -q                       # 745 tests, under a minute, offline; no Docker, SSH or keys
+pytest -q                       # offline; no Docker, SSH or keys; see docs/VERIFICATION.md
 ruff check src tests examples
 python examples/rehearse_rollout.py
 ```
 
-On Windows, 4 contract tests that need POSIX symlinks or exec bits are skipped; CI runs
-all of them on Linux.
+Without `sh` on PATH, the 18 real-shell executor contract cases are skipped. With Git's
+bundled `sh` on Windows, four cases still require POSIX symlinks or execute bits and skip.
+Linux CI exercises those contracts; a separate drive-path guard test is Windows-only.
 
 - [`tests/test_executor_contract.py`](tests/test_executor_contract.py) runs one
   behavioural contract against the in-memory `FakeExecutor` *and* against the real

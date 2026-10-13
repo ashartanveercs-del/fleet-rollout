@@ -7,16 +7,27 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12"]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
+      - name: Use Git's shell for Windows executor contract cases when available
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path 'C:\Program Files\Git\usr\bin\sh.exe') {
+            'C:\Program Files\Git\usr\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
       - run: ruff check src tests examples
       - run: pytest -q
       - run: python examples/rehearse_rollout.py
