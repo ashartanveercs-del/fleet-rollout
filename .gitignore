@@ -9,3 +9,17 @@ build/
 .env
 # operator-side state written by a real rollout (ledger, backups, approvals, locks)
 .fleet-state/
+
+# Local credentials and generated secret-scan output
+.env.*
+!.env.example
+.envrc
+.direnv/
+/.aws/
+/.ssh/
+/credentials.json
+/client_secret*.json
+/token.json
+/tokens.json
+/service-account*.json
+gitleaks-report.*

@@ -417,6 +417,11 @@ Linux CI exercises those contracts; a separate drive-path guard test is Windows-
 - Remote state backends (object storage with conditional writes) for multi-operator teams
 - `fleet-rollout plan --json` for review bots
 
+## Secret scanning
+
+[Full-history audit and secret-scan CI](docs/SECURITY-AUDIT.md). Configuration examples and
+synthetic fixtures were reviewed before publication; new credential findings fail the gate.
+
 ## License
 
 MIT
